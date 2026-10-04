@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 @testable import MuesliCore
 @testable import MuesliNativeApp
-import SQLite3
+import CSQLCipher
 import Testing
 
 @Suite("Local Insights", .serialized)
@@ -10,7 +10,7 @@ struct InsightsTests {
     private func makeStore() throws -> DictationStore {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("muesli-insights-test-\(UUID().uuidString).db")
-        let store = DictationStore(databaseURL: url)
+        let store = configuredTestStore(databaseURL: url)
         try store.migrateIfNeeded()
         return store
     }
@@ -152,7 +152,7 @@ struct InsightsTests {
     @Test("snapshot reads every metric from one SQLite view")
     func snapshotUsesOneSQLiteReadView() throws {
         let store = try makeStore()
-        let writer = DictationStore(databaseURL: store.databasePath())
+        let writer = configuredTestStore(databaseURL: store.databasePath())
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!
         let now = Date(timeIntervalSince1970: 1_784_092_800)
@@ -539,7 +539,7 @@ struct InsightsTests {
 
     private func cacheFootprint(_ store: DictationStore) throws -> (records: Int, blobBytes: Int) {
         var db: OpaquePointer?
-        guard sqlite3_open(store.databasePath().path, &db) == SQLITE_OK else {
+        guard openEncryptedTestDatabase(store.databasePath().path, &db) == SQLITE_OK else {
             throw NSError(domain: "InsightsTests", code: 1)
         }
         defer { sqlite3_close(db) }

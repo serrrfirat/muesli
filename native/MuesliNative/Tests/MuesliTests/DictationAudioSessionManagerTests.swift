@@ -896,7 +896,7 @@ extension ComputerUseRunDiagnosticsTests {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let store = DictationStore(databaseURL: directory.appendingPathComponent("muesli.db"))
+        let store = configuredTestStore(databaseURL: directory.appendingPathComponent("muesli.db"))
         try store.migrateIfNeeded()
         let harness = Harness(routeKind: .speakerLike)
         let controller = MuesliController(

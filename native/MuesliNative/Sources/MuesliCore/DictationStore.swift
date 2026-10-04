@@ -1,10 +1,18 @@
 import Foundation
-import SQLite3
+import CSQLCipher
+import CryptoKit
+import Security
 
 public enum DictationStoreError: Error, LocalizedError {
     case dictationNotFound(id: Int64)
     case meetingNotFound(id: Int64)
     case invalidParticipantIdentifier
+    case invalidEncryptionKey
+    case encryptionNotConfigured
+    case encryptionKeyAlreadyConfigured
+    case encryptionUnavailable
+    case plaintextDatabaseUnsupported
+    case databaseAuthenticationFailed
 
     public var errorDescription: String? {
         switch self {
@@ -14,6 +22,18 @@ public enum DictationStoreError: Error, LocalizedError {
             return "Meeting \(id) no longer exists."
         case .invalidParticipantIdentifier:
             return "That meeting participant could not be identified."
+        case .invalidEncryptionKey:
+            return "Database encryption requires a 32-byte key."
+        case .encryptionNotConfigured:
+            return "Configure database encryption before opening the meeting store."
+        case .encryptionKeyAlreadyConfigured:
+            return "The meeting store already has a different encryption key configured."
+        case .encryptionUnavailable:
+            return "SQLCipher database encryption is unavailable."
+        case .plaintextDatabaseUnsupported:
+            return "An existing unencrypted meeting database cannot be opened. Automatic plaintext migration is not supported."
+        case .databaseAuthenticationFailed:
+            return "The encrypted meeting database could not be authenticated with the configured key."
         }
     }
 }
@@ -31,6 +51,137 @@ public final class DictationStore {
 
     private static let iso8601Formatter = ISO8601DateFormatter()
     private static let iso8601FormatterLock = NSLock()
+    private static let encryptionKeysLock = NSLock()
+    private static var encryptionKeys: [String: Data] = [:]
+
+    /// Registers a vault-derived, 256-bit key for every store opened at this path.
+    /// Hush's native runtime registers its vault key before any database access.
+    public static func configureEncryption(key: Data, databaseURL: URL) throws {
+        guard key.count == 32 else { throw DictationStoreError.invalidEncryptionKey }
+        let rawKey = encodedEncryptionKey(key)
+        let path = databaseURL.standardizedFileURL.path
+        encryptionKeysLock.lock()
+        defer { encryptionKeysLock.unlock() }
+        if let existing = encryptionKeys[path], existing != rawKey {
+            throw DictationStoreError.encryptionKeyAlreadyConfigured
+        }
+        encryptionKeys[path] = rawKey
+    }
+
+    private static func encodedEncryptionKey(_ key: Data) -> Data {
+        // Raw-key syntax avoids re-deriving an already separated key per connection.
+        // SQLCipher still generates and persists the page salt.
+        var rawKey = Data()
+        rawKey.reserveCapacity(67)
+        rawKey.append(120) // x
+        rawKey.append(39) // '
+        for byte in key {
+            let high = byte >> 4
+            let low = byte & 15
+            rawKey.append(high + (high < 10 ? 48 : 87))
+            rawKey.append(low + (low < 10 ? 48 : 87))
+        }
+        rawKey.append(39)
+        return rawKey
+    }
+
+    private static func encryptionKey(databaseURL: URL) throws -> Data {
+        encryptionKeysLock.lock()
+        defer { encryptionKeysLock.unlock() }
+        let path = databaseURL.standardizedFileURL.path
+        if let key = encryptionKeys[path] { return key }
+        let root = databaseURL.deletingLastPathComponent().standardizedFileURL
+        let isHushDatabase = Bundle.main.bundleIdentifier == "ai.privategranola.local"
+            || root.pathComponents.contains("PrivateGranola")
+            || root.pathComponents.contains("PrivateGranola-Mock")
+            || FileManager.default.fileExists(atPath: root.appendingPathComponent("vault.pgenc").path)
+            || FileManager.default.fileExists(atPath: root.appendingPathComponent("test-vault-key.bin").path)
+        // Standalone Hush clients must use the existing original vault identity,
+        // never an unrelated per-path key or an isolated test-mode key file.
+        let resolvedKey: Data
+        if isHushDatabase {
+            resolvedKey = try hushVaultEncryptionKey(directory: root)
+        } else {
+            resolvedKey = try keychainEncryptionKey(databaseURL: databaseURL)
+        }
+        let key = encodedEncryptionKey(resolvedKey)
+        encryptionKeys[path] = key
+        return key
+    }
+
+    private static func hushVaultEncryptionKey(directory: URL) throws -> Data {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: HushDatabaseEncryption.keychainService,
+            kSecAttrAccount as String: HushDatabaseEncryption.keychainAccount(directory: directory),
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            kSecAttrSynchronizable as String: false,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status != errSecItemNotFound else { throw DictationStoreError.encryptionNotConfigured }
+        guard status == errSecSuccess else { throw keychainError(status) }
+        guard let key = result as? Data, key.count == 32 else {
+            throw DictationStoreError.invalidEncryptionKey
+        }
+        return HushDatabaseEncryption.deriveKey(vaultKey: SymmetricKey(data: key))
+    }
+
+    private static func keychainEncryptionKey(databaseURL: URL) throws -> Data {
+        let pathHash = Data(SHA256.hash(data: Data(databaseURL.standardizedFileURL.path.utf8))).base64EncodedString()
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Muesli.SQLCipher.v1",
+            kSecAttrAccount as String: pathHash,
+            kSecAttrSynchronizable as String: false,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
+        ]
+        var lookup = query
+        lookup[kSecReturnData as String] = true
+        lookup[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(lookup as CFDictionary, &result)
+        if status == errSecSuccess {
+            guard let key = result as? Data, key.count == 32 else {
+                throw DictationStoreError.invalidEncryptionKey
+            }
+            return key
+        }
+        guard status == errSecItemNotFound else { throw keychainError(status) }
+        // Never create a replacement key for an existing encrypted (or plaintext)
+        // store. Losing a key requires explicit recovery, not destructive rotation.
+        if FileManager.default.fileExists(atPath: databaseURL.path) {
+            let attributes = try FileManager.default.attributesOfItem(atPath: databaseURL.path)
+            if (attributes[.size] as? NSNumber)?.int64Value != 0 {
+                throw DictationStoreError.encryptionNotConfigured
+            }
+        }
+        var key = Data(count: 32)
+        let randomStatus = key.withUnsafeMutableBytes {
+            SecRandomCopyBytes(kSecRandomDefault, $0.count, $0.baseAddress!)
+        }
+        guard randomStatus == errSecSuccess else { throw keychainError(randomStatus) }
+        var insertion = query
+        insertion.removeValue(forKey: kSecUseAuthenticationUI as String)
+        insertion[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        insertion[kSecValueData as String] = key
+        let insertStatus = SecItemAdd(insertion as CFDictionary, nil)
+        if insertStatus == errSecDuplicateItem {
+            // Another process may have created the key for this same path.
+            return try keychainEncryptionKey(databaseURL: databaseURL)
+        }
+        guard insertStatus == errSecSuccess else { throw keychainError(insertStatus) }
+        return key
+    }
+
+    private static func keychainError(_ status: OSStatus) -> NSError {
+        NSError(domain: NSOSStatusErrorDomain, code: Int(status), userInfo: [
+            NSLocalizedDescriptionKey: "The meeting database encryption key could not be accessed securely."
+        ])
+    }
 
     private let databaseURL: URL
     private static let dictationColumns = """
@@ -135,6 +286,12 @@ public final class DictationStore {
             created_at TEXT DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_meetings_start_time ON meetings(start_time DESC);
+
+        -- Device-local mirror identities are encrypted and never included in cloud records.
+        CREATE TABLE IF NOT EXISTS hush_meeting_mappings (
+            hush_id TEXT PRIMARY KEY NOT NULL,
+            meeting_id INTEGER NOT NULL UNIQUE REFERENCES meetings(id) ON DELETE CASCADE
+        );
         CREATE INDEX IF NOT EXISTS idx_meetings_calendar_event_lookup ON meetings(calendar_event_id) WHERE calendar_event_id IS NOT NULL;
 
         -- Calendar attendee snapshots and manually selected people are device-local.
@@ -1150,6 +1307,205 @@ public final class DictationStore {
             throw lastError(db)
         }
         return sqlite3_last_insert_rowid(db)
+    }
+
+    /// Returns the persisted UUID identities used by Hush's encrypted meeting vault.
+    public func hushMeetingMappings() throws -> [UUID: Int64] {
+        let db = try openDatabase()
+        defer { sqlite3_close(db) }
+        return try hushMeetingMappings(db: db)
+    }
+
+    private func hushMeetingMappings(db: OpaquePointer?) throws -> [UUID: Int64] {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT hush_id, meeting_id FROM hush_meeting_mappings", -1, &statement, nil) == SQLITE_OK else {
+            throw lastError(db)
+        }
+        defer { sqlite3_finalize(statement) }
+        var result: [UUID: Int64] = [:]
+        while true {
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW:
+                guard let id = UUID(uuidString: stringColumn(statement, index: 0)) else {
+                    throw NSError(domain: "MuesliDB", code: Int(SQLITE_CORRUPT), userInfo: [
+                        NSLocalizedDescriptionKey: "The encrypted meeting identity mapping is invalid."
+                    ])
+                }
+                result[id] = sqlite3_column_int64(statement, 1)
+            case SQLITE_DONE:
+                return result
+            default:
+                throw lastError(db)
+            }
+        }
+    }
+
+    /// Inserts or refreshes a vault meeting without changing its native UI identity.
+    @discardableResult
+    public func upsertHushMeeting(
+        id: UUID,
+        title: String,
+        startTime: Date,
+        endTime: Date,
+        rawTranscript: String,
+        formattedNotes: String,
+        manualNotes: String,
+        status: MeetingStatus = .completed
+    ) throws -> Int64 {
+        let db = try openDatabase()
+        defer { sqlite3_close(db) }
+        try exec("BEGIN IMMEDIATE", db: db)
+        do {
+            let uuid = id.uuidString
+            var lookup: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT meeting_id FROM hush_meeting_mappings WHERE hush_id = ?", -1, &lookup, nil) == SQLITE_OK else {
+                throw lastError(db)
+            }
+            defer { sqlite3_finalize(lookup) }
+            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            sqlite3_bind_text(lookup, 1, (uuid as NSString).utf8String, -1, transient)
+            let lookupResult = sqlite3_step(lookup)
+            guard lookupResult == SQLITE_ROW || lookupResult == SQLITE_DONE else { throw lastError(db) }
+            var meetingID: Int64?
+            if lookupResult == SQLITE_ROW { meetingID = sqlite3_column_int64(lookup, 0) }
+
+            let sql: String
+            if meetingID != nil {
+                sql = """
+                UPDATE meetings SET title = ?, start_time = ?, end_time = ?, duration_seconds = ?,
+                    raw_transcript = ?, formatted_notes = ?, manual_notes = ?, meeting_status = ?,
+                    word_count = ?, updated_at = ?, deleted_at = NULL, sync_dirty = 0 WHERE id = ?
+                """
+            } else {
+                sql = """
+                INSERT INTO meetings (title, start_time, end_time, duration_seconds, raw_transcript,
+                    formatted_notes, manual_notes, meeting_status, word_count, updated_at, sync_dirty)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """
+            }
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { throw lastError(db) }
+            defer { sqlite3_finalize(statement) }
+            let start = formatISODate(startTime)
+            let end = formatISODate(endTime)
+            sqlite3_bind_text(statement, 1, (title as NSString).utf8String, -1, transient)
+            sqlite3_bind_text(statement, 2, (start as NSString).utf8String, -1, transient)
+            sqlite3_bind_text(statement, 3, (end as NSString).utf8String, -1, transient)
+            sqlite3_bind_double(statement, 4, max(endTime.timeIntervalSince(startTime), 0))
+            sqlite3_bind_text(statement, 5, (rawTranscript as NSString).utf8String, -1, transient)
+            sqlite3_bind_text(statement, 6, (formattedNotes as NSString).utf8String, -1, transient)
+            sqlite3_bind_text(statement, 7, (manualNotes as NSString).utf8String, -1, transient)
+            sqlite3_bind_text(statement, 8, (status.rawValue as NSString).utf8String, -1, transient)
+            sqlite3_bind_int64(statement, 9, Int64(Self.countWords(in: rawTranscript)))
+            sqlite3_bind_double(statement, 10, Date().timeIntervalSince1970)
+            if let meetingID { sqlite3_bind_int64(statement, 11, meetingID) }
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw lastError(db) }
+            if meetingID == nil {
+                meetingID = sqlite3_last_insert_rowid(db)
+                var mapping: OpaquePointer?
+                guard sqlite3_prepare_v2(db, "INSERT INTO hush_meeting_mappings (hush_id, meeting_id) VALUES (?, ?)", -1, &mapping, nil) == SQLITE_OK else {
+                    throw lastError(db)
+                }
+                defer { sqlite3_finalize(mapping) }
+                sqlite3_bind_text(mapping, 1, (uuid as NSString).utf8String, -1, transient)
+                sqlite3_bind_int64(mapping, 2, meetingID!)
+                guard sqlite3_step(mapping) == SQLITE_DONE else { throw lastError(db) }
+            }
+            try exec("COMMIT", db: db)
+            return meetingID!
+        } catch {
+            sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            throw error
+        }
+    }
+
+    /// Removes only mirrored Hush rows absent from the authoritative vault snapshot.
+    public func deleteHushMeetings(except ids: Set<UUID>) throws {
+        let db = try openDatabase()
+        defer { sqlite3_close(db) }
+        try exec("BEGIN IMMEDIATE", db: db)
+        do {
+            let mappings = try hushMeetingMappings(db: db)
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "DELETE FROM meetings WHERE id = ? AND id IN (SELECT meeting_id FROM hush_meeting_mappings)", -1, &statement, nil) == SQLITE_OK else {
+                throw lastError(db)
+            }
+            defer { sqlite3_finalize(statement) }
+            for (id, meetingID) in mappings where !ids.contains(id) {
+                sqlite3_reset(statement)
+                sqlite3_clear_bindings(statement)
+                sqlite3_bind_int64(statement, 1, meetingID)
+                guard sqlite3_step(statement) == SQLITE_DONE else { throw lastError(db) }
+            }
+            try exec("COMMIT", db: db)
+        } catch {
+            sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            throw error
+        }
+    }
+
+    /// Attaches native navigation/calendar context without changing vault ownership.
+    public func configureHushMeetingContext(
+        id: Int64,
+        folderID: Int64?,
+        followUpToID: Int64?,
+        calendarOccurrence: CalendarOccurrenceReference?
+    ) throws {
+        guard followUpToID != id else {
+            throw NSError(domain: "MuesliDB", code: Int(SQLITE_CONSTRAINT), userInfo: [
+                NSLocalizedDescriptionKey: "A meeting cannot be its own follow-up predecessor."
+            ])
+        }
+        let db = try openDatabase()
+        defer { sqlite3_close(db) }
+        let followUpRecordName = try followUpToID.flatMap { try meetingCloudRecordName(id: $0, db: db) }
+        let sql = """
+        UPDATE meetings
+        SET folder_id = ?, follow_up_to_id = ?, follow_up_to_record_name = ?,
+            calendar_event_id = ?, calendar_occurrence_key = ?, calendar_source = ?,
+            calendar_id = ?, calendar_series_id = ?, calendar_occurrence_start = ?,
+            updated_at = ?, sync_dirty = 0
+        WHERE id = ? AND deleted_at IS NULL
+          AND id IN (SELECT meeting_id FROM hush_meeting_mappings)
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw lastError(db)
+        }
+        defer { sqlite3_finalize(statement) }
+        if let folderID {
+            sqlite3_bind_int64(statement, 1, folderID)
+        } else {
+            sqlite3_bind_null(statement, 1)
+        }
+        if let followUpToID {
+            sqlite3_bind_int64(statement, 2, followUpToID)
+        } else {
+            sqlite3_bind_null(statement, 2)
+        }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        func bindContextText(_ text: String?, at index: Int32) {
+            if let text {
+                sqlite3_bind_text(statement, index, (text as NSString).utf8String, -1, transient)
+            } else {
+                sqlite3_bind_null(statement, index)
+            }
+        }
+        bindContextText(followUpRecordName, at: 3)
+        bindContextText(calendarOccurrence?.eventID, at: 4)
+        bindContextText(calendarOccurrence?.identityKey, at: 5)
+        bindContextText(calendarOccurrence?.provider.rawValue, at: 6)
+        bindContextText(calendarOccurrence?.calendarID, at: 7)
+        bindContextText(calendarOccurrence?.seriesID, at: 8)
+        if let calendarOccurrence {
+            sqlite3_bind_double(statement, 9, calendarOccurrence.originalStartTime.timeIntervalSince1970)
+        } else {
+            sqlite3_bind_null(statement, 9)
+        }
+        sqlite3_bind_double(statement, 10, Date().timeIntervalSince1970)
+        sqlite3_bind_int64(statement, 11, id)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw lastError(db) }
+        guard sqlite3_changes(db) > 0 else { throw DictationStoreError.meetingNotFound(id: id) }
     }
 
     public func listMeetingParticipants(meetingID: Int64) throws -> [MeetingParticipant] {
@@ -3663,6 +4019,7 @@ public final class DictationStore {
         FROM meetings AS m
         LEFT JOIN meetings AS predecessor ON predecessor.id = m.follow_up_to_id
         WHERE m.cloud_record_name IN (\(placeholders))
+          AND m.id NOT IN (SELECT meeting_id FROM hush_meeting_mappings)
         """
         var meetingStatement: OpaquePointer?
         guard sqlite3_prepare_v2(db, meetingSQL, -1, &meetingStatement, nil) == SQLITE_OK else {
@@ -4099,6 +4456,7 @@ public final class DictationStore {
         FROM meetings
         WHERE cloud_record_name IS NOT NULL
           AND meeting_status NOT IN ('recording', 'processing')
+          AND id NOT IN (SELECT meeting_id FROM hush_meeting_mappings)
           AND (
               cloud_change_tag IS NOT NULL
               OR cloud_system_fields IS NOT NULL
@@ -4168,6 +4526,7 @@ public final class DictationStore {
         LEFT JOIN meetings AS predecessor ON predecessor.id = m.follow_up_to_id
         WHERE m.sync_dirty = 1 AND m.cloud_record_name IS NOT NULL
           AND m.meeting_status NOT IN (?, ?)
+          AND m.id NOT IN (SELECT meeting_id FROM hush_meeting_mappings)
         ORDER BY m.updated_at DESC, m.id DESC
         LIMIT ?
         OFFSET ?
@@ -4272,6 +4631,7 @@ public final class DictationStore {
         FROM meetings AS m
         LEFT JOIN meetings AS predecessor ON predecessor.id = m.follow_up_to_id
         WHERE m.cloud_record_name IS NOT NULL
+          AND m.id NOT IN (SELECT meeting_id FROM hush_meeting_mappings)
         ORDER BY m.updated_at DESC, m.id DESC
         LIMIT ?
         OFFSET ?
@@ -4312,6 +4672,7 @@ public final class DictationStore {
         WHERE sync_dirty = 1
           AND cloud_record_name IS NOT NULL
           AND meeting_status NOT IN (?, ?)
+          AND id NOT IN (SELECT meeting_id FROM hush_meeting_mappings)
         LIMIT 1
         """
         var statement: OpaquePointer?
@@ -4612,11 +4973,15 @@ public final class DictationStore {
     }
 
     private func ensureCloudRecordNames(table: String, prefix: String, db: OpaquePointer?) throws {
+        let privateMeetingFilter = table == "meetings"
+            ? "AND id NOT IN (SELECT meeting_id FROM hush_meeting_mappings)"
+            : ""
         let sql = """
         SELECT id
         FROM \(table)
         WHERE (cloud_record_name IS NULL OR cloud_record_name = '')
           AND deleted_at IS NULL
+          \(privateMeetingFilter)
         """
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -4637,6 +5002,7 @@ public final class DictationStore {
                 updated_at = CASE WHEN updated_at = 0 THEN ? ELSE updated_at END,
                 sync_dirty = 1
             WHERE id = ?
+              \(privateMeetingFilter)
             """
             var update: OpaquePointer?
             guard sqlite3_prepare_v2(db, updateSQL, -1, &update, nil) == SQLITE_OK else {
@@ -5144,24 +5510,67 @@ public final class DictationStore {
     }
 
     private func openDatabase() throws -> OpaquePointer? {
+        if FileManager.default.fileExists(atPath: databaseURL.path) {
+            let file = try FileHandle(forReadingFrom: databaseURL)
+            defer { try? file.close() }
+            if try file.read(upToCount: 16) == Data("SQLite format 3\0".utf8) {
+                throw DictationStoreError.plaintextDatabaseUnsupported
+            }
+        }
+        let key = try Self.encryptionKey(databaseURL: databaseURL)
         try FileManager.default.createDirectory(
             at: databaseURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
         var db: OpaquePointer?
-        if sqlite3_open(databaseURL.path, &db) != SQLITE_OK {
+        var opened = false
+        defer { if !opened { sqlite3_close(db) } }
+        guard sqlite3_open(databaseURL.path, &db) == SQLITE_OK else {
             throw lastError(db)
         }
-        if sqlite3_busy_timeout(db, 5_000) != SQLITE_OK {
-            throw lastError(db)
+        let keyResult = key.withUnsafeBytes {
+            sqlite3_key(db, $0.baseAddress, Int32(key.count))
         }
-        if sqlite3_exec(db, "PRAGMA foreign_keys=ON", nil, nil, nil) != SQLITE_OK {
-            throw lastError(db)
+        guard keyResult == SQLITE_OK else {
+            throw DictationStoreError.databaseAuthenticationFailed
         }
-        if sqlite3_exec(db, "PRAGMA journal_mode=WAL", nil, nil, nil) != SQLITE_OK {
-            throw lastError(db)
+        do {
+            var cipherVersion: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "PRAGMA cipher_version", -1, &cipherVersion, nil) == SQLITE_OK else {
+                throw DictationStoreError.encryptionUnavailable
+            }
+            defer { sqlite3_finalize(cipherVersion) }
+            guard sqlite3_step(cipherVersion) == SQLITE_ROW,
+                  !stringColumn(cipherVersion, index: 0).isEmpty else {
+                throw DictationStoreError.encryptionUnavailable
+            }
         }
+        // Reading the encrypted schema authenticates the supplied key before writes.
+        do {
+            var schema: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master", -1, &schema, nil) == SQLITE_OK else {
+                throw schemaReadError(db)
+            }
+            defer { sqlite3_finalize(schema) }
+            guard sqlite3_step(schema) == SQLITE_ROW else {
+                throw schemaReadError(db)
+            }
+        }
+        guard sqlite3_busy_timeout(db, 5_000) == SQLITE_OK else { throw lastError(db) }
+        try exec("PRAGMA temp_store=MEMORY", db: db)
+        try exec("PRAGMA foreign_keys=ON", db: db)
+        try exec("PRAGMA journal_mode=WAL", db: db)
+        opened = true
         return db
+    }
+
+    private func schemaReadError(_ db: OpaquePointer?) -> Error {
+        switch sqlite3_errcode(db) {
+        case SQLITE_NOTADB, SQLITE_CORRUPT:
+            return DictationStoreError.databaseAuthenticationFailed
+        default:
+            return lastError(db)
+        }
     }
 
     private func exec(_ sql: String, db: OpaquePointer?) throws {

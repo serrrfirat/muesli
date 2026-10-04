@@ -46,7 +46,8 @@ actor WhisperKitTranscriber {
                 computeOptions: ModelComputeOptions(
                     audioEncoderCompute: .cpuAndNeuralEngine,
                     textDecoderCompute: .cpuAndNeuralEngine
-                )
+                ),
+                verbose: false
             )
             return try await WhisperKit(config)
         }
@@ -71,6 +72,24 @@ actor WhisperKitTranscriber {
         let results = try await whisperKit.transcribe(audioPath: wavURL.path, decodeOptions: decodeOptions)
         let elapsed = CFAbsoluteTimeGetCurrent() - start
 
+        let text = results.map(\.text).joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (text: text, processingTime: elapsed)
+    }
+
+    /// Transcribe 16 kHz mono samples without writing audio to disk.
+    func transcribe(
+        samples: [Float],
+        language: WhisperKitLanguage = .defaultLanguage
+    ) async throws -> (text: String, processingTime: Double) {
+        guard let whisperKit, let loadedModel else { throw TranscriberError.notLoaded }
+
+        let start = CFAbsoluteTimeGetCurrent()
+        let decodeOptions = Self.makeDecodeOptions(language: language, modelName: loadedModel)
+        let results: [TranscriptionResult] = try await whisperKit.transcribe(
+            audioArray: samples, decodeOptions: decodeOptions
+        )
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
         let text = results.map(\.text).joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return (text: text, processingTime: elapsed)

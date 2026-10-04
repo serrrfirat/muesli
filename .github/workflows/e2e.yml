@@ -1,0 +1,24 @@
+name: Native binary E2E
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  e2e:
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install crypto libraries
+        run: brew install libsodium sqlcipher
+      - name: Exercise native binary with explicit external mocks
+        run: ./scripts/e2e.sh
+      - name: Preserve binary E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-e2e-evidence
+          path: .e2e/
+          include-hidden-files: true

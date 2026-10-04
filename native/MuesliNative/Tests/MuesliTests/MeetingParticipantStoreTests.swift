@@ -1,6 +1,6 @@
 import Foundation
 import MuesliCore
-import SQLite3
+import CSQLCipher
 import Testing
 
 @Suite("Meeting participants", .serialized)
@@ -8,7 +8,7 @@ struct MeetingParticipantStoreTests {
     private func makeStore() throws -> DictationStore {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("muesli-participants-\(UUID().uuidString).db")
-        let store = DictationStore(databaseURL: url)
+        let store = configuredTestStore(databaseURL: url)
         try store.migrateIfNeeded()
         return store
     }
@@ -46,7 +46,7 @@ struct MeetingParticipantStoreTests {
         try store.migrateIfNeeded()
 
         var database: OpaquePointer?
-        #expect(sqlite3_open(store.databasePath().path, &database) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(store.databasePath().path, &database) == SQLITE_OK)
         defer { sqlite3_close(database) }
 
         var statement: OpaquePointer?

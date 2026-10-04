@@ -41,6 +41,8 @@ enum TranscriptCleanupClient {
             return Gemma4LiteRTModel.e2b.repoID
         }
         switch backend.llmBackend {
+        case .some(.nearAI):
+            return AppSettings().model
         case .some(.chatGPT):
             return SummaryModelPreset.chatGPTTranscriptCleanupModels.first?.id ?? "gpt-6-luna"
         case .some(.openAI):
@@ -66,6 +68,8 @@ enum TranscriptCleanupClient {
         }
         let raw: String
         switch backend.llmBackend {
+        case .some(.nearAI):
+            raw = config.nearAIModel
         case .some(.chatGPT):
             raw = config.postProcessorChatGPTModel
         case .some(.openAI):
@@ -95,6 +99,9 @@ enum TranscriptCleanupClient {
             return Gemma4LiteRTModelStore.isAvailableLocally(model: model)
         }
         switch backend.llmBackend {
+        case .some(.nearAI):
+            // The shared client performs mandatory verification before every request.
+            return true
         case .some(.chatGPT):
             return isChatGPTAuthenticated
         case .some(.openAI):
@@ -172,7 +179,10 @@ enum TranscriptCleanupClient {
         guard let llmBackend = backend.llmBackend else {
             throw TranscriptCleanupError.missingConfiguration("Local generation is handled on device.")
         }
+        try await HushInferencePolicy.validate(backend: llmBackend.backend, config: config)
         switch llmBackend {
+        case .nearAI:
+            return try await HushNearAIProvider.complete(systemPrompt: systemPrompt, userPrompt: userPrompt, model: config.nearAIModel)
         case .chatGPT:
             return try await ChatGPTResponsesClient.respond(
                 systemPrompt: systemPrompt,

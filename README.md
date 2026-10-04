@@ -10,7 +10,7 @@
 
 <p align="center">
   <strong>Local-by-default dictation & meeting transcription for macOS</strong><br>
-  On-device speech-to-text by default · Optional OpenAI or OpenRouter dictation · Privacy by default
+  On-device speech-to-text · Encrypted meeting storage · Native Muesli UI
 </p>
 
 <p align="center">
@@ -21,6 +21,28 @@
 </p>
 
 ---
+
+## This fork
+
+**[`serrrfirat/muesli`](https://github.com/serrrfirat/muesli) is the canonical repository.** It retains Muesli's UI, native source layout and upstream history, with the required Hush features ported directly into `native/MuesliNative`. There is no nested Muesli checkout or dependency on the Hush repository.
+
+The port preserves encrypted meetings/audio queues, authenticated backups, NEAR AI trust/inference, cited cross-meeting chat, summaries/recipes, wallet/quota/staking boundaries, recent appearance/calendar/navigation features and every existing binary E2E scenario. Native local meeting ASR receives decrypted audio in RAM, not temporary plaintext files. Native meeting summaries accept verified NEAR AI or explicitly configured loopback providers; private Hush meeting rows are excluded from iCloud sync. Telemetry and upstream update feeds are disabled.
+
+Build with Swift 6.3 and Homebrew `libsodium`/`sqlcipher`:
+
+```sh
+brew install libsodium sqlcipher
+./scripts/start.sh --mock
+./scripts/e2e.sh --capture-off
+./scripts/e2e.sh --capture --synthetic-microphone --playback
+```
+
+These commands build the real native application and exercise shared user actions. External mocks are explicitly labelled; synthetic microphone PCM is never reported as physical-microphone proof. Production NEAR AI remains fail-closed without approved attestation/channel-binding evidence; local wallet/staking mocks are not transactions or yield.
+
+The developer artifact remains `Hush.app` with the original bundle, support-directory and Keychain identities to preserve access to existing encrypted data. That compatibility does not make Hush the active repository or restore its old UI. See [build/E2E instructions](scripts/README.md), [migration decisions](docs/DECISIONS.md), and [verification evidence](docs/LOCAL-VERIFICATION.md).
+
+The sections below retain upstream Muesli's release documentation. Upstream hosted-provider, sync, release and download claims are not guarantees for this fork; the fork policy and commands above take precedence. Source targets macOS 14.2+, but this developer artifact is exercised on macOS 26.5 and installed Homebrew bottles may require newer macOS.
+
 
 ## What is Muesli?
 

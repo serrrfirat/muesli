@@ -17,6 +17,16 @@ struct BackendOption: Equatable {
     let description: String
     let recommended: Bool
 
+    /// Hosted meeting transcription; deliberately absent from the local model-download catalog.
+    static let nearAI = BackendOption(
+        backend: "near_ai",
+        model: "openai/whisper-large-v3",
+        label: "NEAR AI Whisper",
+        sizeLabel: "Hosted · verified endpoint required",
+        description: "Send audio only after approved endpoint verification. Audio uses TLS, not chat E2EE.",
+        recommended: false
+    )
+
     static let parakeetUnified = BackendOption(
         backend: "parakeet-unified",
         model: "FluidInference/parakeet-unified-en-0.6b-coreml",
@@ -284,6 +294,7 @@ struct BackendOption: Equatable {
     }
 
     static func resolve(backend: String, model: String) -> BackendOption? {
+        if backend == nearAI.backend, model == nearAI.model { return .nearAI }
         // Compatibility for saved selections from the retired Indic backend.
         if backend == "indicasr" {
             return all.first { $0.backend == "bodhan" && $0.model == model } ?? .bodhanFlex
@@ -310,7 +321,7 @@ struct BackendOption: Equatable {
     var supportsMeetingTranscription: Bool {
         Self.parakeetFamily.contains(self) || Self.whisperFamily.contains(self)
             || Self.bodhanFamily.contains(self) || self == .appleSpeechAnalyzer
-            || self == .nemotron35Multilingual
+            || self == .nemotron35Multilingual || self == .nearAI
     }
 
     var isSystemManaged: Bool {
@@ -1060,6 +1071,7 @@ extension MeetingSummaryBackendOption {
         case .ollama: return \.ollamaModel
         case .lmStudio: return \.lmStudioModel
         case .claudeCode: return \.claudeCodeModel
+        case .nearAI: return \.nearAIModel
         default: return \.customLLMModel
         }
     }
@@ -1083,6 +1095,8 @@ extension MeetingSummaryBackendOption {
             presets = [SummaryModelPreset.openRouterModels[0]]
                 + openRouterModels.filter { $0.id != "openrouter/free" }
         case .ollama: presets = [SummaryModelPreset(id: "qwen3.5", label: "qwen3.5 (default)")]
+        case .nearAI:
+            presets = InferenceClient.chatModels.sorted().map { SummaryModelPreset(id: $0, label: $0) }
         default: presets = []
         }
         return SummaryModelPreset.menuPresets(presets, currentModel: config[keyPath: modelKeyPath])
@@ -1133,7 +1147,12 @@ struct MeetingSummaryBackendOption: Equatable {
         label: "Custom LLM"
     )
 
-    static let all: [MeetingSummaryBackendOption] = [.chatGPT, .openAI, .anthropic, .claudeCode, .openRouter, .ollama, .lmStudio, .customLLM]
+    static let nearAI = MeetingSummaryBackendOption(
+        backend: "near_ai",
+        label: "NEAR AI"
+    )
+
+    static let all: [MeetingSummaryBackendOption] = [.nearAI, .chatGPT, .openAI, .anthropic, .claudeCode, .openRouter, .ollama, .lmStudio, .customLLM]
 
     static func selectable(config: AppConfig, selected: MeetingSummaryBackendOption? = nil) -> [MeetingSummaryBackendOption] {
         guard ClaudeCodeSummarizer.executableURL(configuredPath: config.claudeCodeExecutablePath) == nil,
@@ -1756,6 +1775,7 @@ struct AppConfig: Codable {
     var meetingTranscriptionBackend: String = BackendOption.whisper.backend
     var meetingTranscriptionModel: String = BackendOption.whisper.model
     var meetingSummaryBackend: String = MeetingSummaryBackendOption.chatGPT.backend
+    var nearAIModel: String = AppSettings().model
     var defaultMeetingTemplateID: String = MeetingTemplates.autoID
     var whisperModel: String = BackendOption.whisper.model
     var idleTimeout: Double = 120
@@ -1908,6 +1928,7 @@ struct AppConfig: Codable {
         case meetingTranscriptionBackend = "meeting_transcription_backend"
         case meetingTranscriptionModel = "meeting_transcription_model"
         case meetingSummaryBackend = "meeting_summary_backend"
+        case nearAIModel = "near_ai_model"
         case defaultMeetingTemplateID = "default_meeting_template_id"
         case whisperModel = "whisper_model"
         case idleTimeout = "idle_timeout"
@@ -2075,6 +2096,7 @@ struct AppConfig: Codable {
             meetingTranscriptionBackend = migrated.backend; meetingTranscriptionModel = migrated.model
         }
         meetingSummaryBackend = (try? c.decode(String.self, forKey: .meetingSummaryBackend)) ?? defaults.meetingSummaryBackend
+        nearAIModel = (try? c.decode(String.self, forKey: .nearAIModel)) ?? defaults.nearAIModel
         defaultMeetingTemplateID = (try? c.decode(String.self, forKey: .defaultMeetingTemplateID)) ?? defaults.defaultMeetingTemplateID
         whisperModel = (try? c.decode(String.self, forKey: .whisperModel)) ?? defaults.whisperModel
         idleTimeout = (try? c.decode(Double.self, forKey: .idleTimeout)) ?? defaults.idleTimeout

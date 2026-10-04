@@ -28,16 +28,18 @@ let package = Package(
     targets: [
         .target(
             name: "MuesliCore",
-            dependencies: [],
+            dependencies: ["CSQLCipher"],
             path: "Sources/MuesliCore",
             linkerSettings: [
-                .linkedLibrary("sqlite3"),
+                .linkedLibrary("sqlcipher"),
             ]
         ),
         .target(
             name: "MuesliNativeApp",
             dependencies: [
                 "MuesliCore",
+                "CSodium",
+                "CSQLCipher",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "LLM", package: "LLM.swift"),
@@ -53,7 +55,7 @@ let package = Package(
             ],
             path: "Sources/MuesliNativeApp",
             linkerSettings: [
-                .linkedLibrary("sqlite3"),
+                .linkedLibrary("sqlcipher"),
                 .linkedFramework("Contacts"),
                 .linkedFramework("ContactsUI"),
             ]
@@ -83,6 +85,18 @@ let package = Package(
             ],
             path: "Sources/MuesliCLI"
         ),
+        .systemLibrary(
+            name: "CSodium",
+            path: "Sources/CSodium",
+            pkgConfig: "libsodium",
+            providers: [.brew(["libsodium"])]
+        ),
+        .systemLibrary(
+            name: "CSQLCipher",
+            path: "Sources/CSQLCipher",
+            pkgConfig: "sqlcipher",
+            providers: [.brew(["sqlcipher"])]
+        ),
         .target(
             name: "AudioGraphExceptionBridge",
             path: "Sources/AudioGraphExceptionBridge",
@@ -104,10 +118,10 @@ let package = Package(
         ),
         .testTarget(
             name: "MuesliTests",
-            dependencies: ["MuesliNativeApp", "MuesliCore", "MuesliCLI", "AudioGraphExceptionBridge", "LocalVQEBridge"],
+            dependencies: ["MuesliNativeApp", "MuesliCore", "MuesliCLI", "CSQLCipher", "AudioGraphExceptionBridge", "LocalVQEBridge"],
             path: "Tests/MuesliTests",
             linkerSettings: [
-                .linkedLibrary("sqlite3"),
+                .linkedLibrary("sqlcipher"),
             ]
         ),
     ],

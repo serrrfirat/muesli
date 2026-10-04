@@ -71,6 +71,15 @@ actor SenseVoiceTranscriber {
         return (text, processingTime)
     }
 
+    /// Transcribe 16 kHz mono samples without writing audio to disk.
+    func transcribe(samples: [Float]) async throws -> (text: String, processingTime: Double) {
+        guard let manager else { throw TranscriberError.notLoaded }
+        let start = CFAbsoluteTimeGetCurrent()
+        let text = try await manager.transcribe(audio: samples)
+        let processingTime = CFAbsoluteTimeGetCurrent() - start
+        return (text, processingTime)
+    }
+
     func shutdown() {
         manager = nil
         hasCompletedWarmup = false

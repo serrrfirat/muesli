@@ -1217,6 +1217,10 @@ struct MeetingDetailView: View {
                                 }
                             }
                         }
+                    } else if controller.hushModel != nil,
+                              !HushInferencePolicy.permits(backend: provider.backend, config: appState.config) {
+                        Text("\(provider.label) — outside Hush trust policy")
+                            .disabled(true)
                     }
                 }
             } label: {

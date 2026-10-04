@@ -484,12 +484,34 @@ actor Gemma4LiteRTTranscriber {
         await acquireOperation()
         defer { releaseOperation() }
         try await prepareEngine(model: model)
-        return try transcribePrepared(wavURL: wavURL)
+        return try transcribePrepared(
+            messageJSON: Self.userMessageJSONString(wavURL: wavURL),
+            audioDuration: Self.validateAudioDuration(wavURL: wavURL)
+        )
     }
 
-    private func transcribePrepared(wavURL: URL) throws -> (text: String, processingTime: Double) {
+    func transcribe(
+        samples: [Float],
+        model: Gemma4LiteRTModel
+    ) async throws -> (text: String, processingTime: Double) {
+        await acquireOperation()
+        defer { releaseOperation() }
+        try await prepareEngine(model: model)
+        let audioDuration = try Self.validateAudioDuration(
+            seconds: Double(samples.count) / 16_000
+        )
+        let messageJSON = try Self.messageJSONString(role: "user", contents: [
+            ["type": "text", "text": Gemma4LiteRTModelStore.resolvedPrompt()],
+            ["type": "audio", "blob": Self.encodedWAV(samples: samples).base64EncodedString()],
+        ])
+        return try transcribePrepared(messageJSON: messageJSON, audioDuration: audioDuration)
+    }
+
+    private func transcribePrepared(
+        messageJSON: String,
+        audioDuration: Double
+    ) throws -> (text: String, processingTime: Double) {
         guard let engine else { throw TranscriberError.notLoaded }
-        let audioDuration = try Self.validateAudioDuration(wavURL: wavURL)
         Gemma4LiteRTLogging.profile(
             "inference_started audio_seconds=\(String(format: "%.3f", audioDuration))"
         )
@@ -526,7 +548,6 @@ actor Gemma4LiteRTTranscriber {
         }
         defer { litert_lm_conversation_optional_args_delete(optionalArgs) }
 
-        let messageJSON = try Self.userMessageJSONString(wavURL: wavURL)
         guard let jsonResponse = litert_lm_conversation_send_message(conversation, messageJSON, nil, optionalArgs) else {
             throw TranscriberError.invalidResponse
         }
@@ -639,7 +660,6 @@ actor Gemma4LiteRTTranscriber {
 
         let response = String(cString: responseCString)
         let rawOutput = try Self.textContent(fromResponseJSON: response)
-        Gemma4LiteRTLogging.log("cleanup raw output: \(rawOutput)")
         let cleaned = TranscriptCleanupClient.cleanOutput(rawOutput)
         let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty, !Qwen3DeletionCueDetector.containsDeletionCue(text) {
@@ -647,7 +667,7 @@ actor Gemma4LiteRTTranscriber {
             throw TranscriberError.invalidResponse
         }
         if Qwen3PostProcessorOutputCleaner.shouldFallbackToInput(cleaned: trimmed, input: text) {
-            Gemma4LiteRTLogging.log("cleanup rejected by transcript safety checks: \(trimmed)")
+            Gemma4LiteRTLogging.log("cleanup rejected by transcript safety checks")
             throw TranscriberError.invalidResponse
         }
 
@@ -794,11 +814,11 @@ actor Gemma4LiteRTTranscriber {
     static func validatedTranscript(fromResponseJSON responseJSON: String) throws -> String {
         let cleaned = cleanTranscript(try textContent(fromResponseJSON: responseJSON))
         guard !looksLikePromptLeak(cleaned) else {
-            Gemma4LiteRTLogging.log("rejected leaked Gemma prompt text: \(cleaned.prefix(160))")
+            Gemma4LiteRTLogging.log("rejected leaked Gemma prompt text")
             throw TranscriberError.invalidResponse
         }
         guard !looksLikeAssistantResponse(cleaned) else {
-            Gemma4LiteRTLogging.log("rejected assistant-style Gemma response: \(cleaned.prefix(160))")
+            Gemma4LiteRTLogging.log("rejected assistant-style Gemma response")
             throw TranscriberError.invalidResponse
         }
         return cleaned
@@ -917,11 +937,48 @@ actor Gemma4LiteRTTranscriber {
     @discardableResult
     static func validateAudioDuration(wavURL: URL) throws -> Double {
         let wav = try WavReader.readFloatMonoWAV(from: wavURL)
-        let duration = Double(wav.samples.count) / Double(wav.sampleRate)
-        guard duration <= maxAudioDurationSeconds else {
-            throw TranscriberError.audioTooLong(seconds: duration, maxSeconds: maxAudioDurationSeconds)
+        return try validateAudioDuration(seconds: Double(wav.samples.count) / Double(wav.sampleRate))
+    }
+
+    @discardableResult
+    private static func validateAudioDuration(seconds: Double) throws -> Double {
+        guard seconds <= maxAudioDurationSeconds else {
+            throw TranscriberError.audioTooLong(seconds: seconds, maxSeconds: maxAudioDurationSeconds)
         }
-        return duration
+        return seconds
+    }
+
+    /// Encoded PCM16 WAV for LiteRT's in-memory audio `blob`; never persisted.
+    private static func encodedWAV(samples: [Float]) -> Data {
+        let payloadSize = samples.count * MemoryLayout<Int16>.size
+        var data = Data(capacity: 44 + payloadSize)
+        func append<T: FixedWidthInteger>(_ value: T) {
+            var littleEndian = value.littleEndian
+            withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+        }
+        data.append(contentsOf: "RIFF".utf8)
+        append(UInt32(36 + payloadSize))
+        data.append(contentsOf: "WAVEfmt ".utf8)
+        append(UInt32(16))
+        append(UInt16(1))
+        append(UInt16(1))
+        append(UInt32(16_000))
+        append(UInt32(32_000))
+        append(UInt16(2))
+        append(UInt16(16))
+        data.append(contentsOf: "data".utf8)
+        append(UInt32(payloadSize))
+        data.count = 44 + payloadSize
+        data.withUnsafeMutableBytes { rawBytes in
+            let bytes = rawBytes.bindMemory(to: UInt8.self)
+            for (index, sample) in samples.enumerated() {
+                let value = Int16((min(1, max(-1, sample)) * Float(Int16.max)).rounded())
+                let bits = UInt16(bitPattern: value)
+                bytes[44 + index * 2] = UInt8(truncatingIfNeeded: bits)
+                bytes[45 + index * 2] = UInt8(truncatingIfNeeded: bits >> 8)
+            }
+        }
+        return data
     }
 
     private static func supportsMTP(modelURL: URL) -> Bool {

@@ -378,7 +378,9 @@ public final class MuesliController: NSObject {
     private static let screenContextGrantIntentTimeout: TimeInterval = 15 * 60
     private let runtime: RuntimePaths
     private let configStore: ConfigStore
-    private let dictationStore: DictationStore
+    let dictationStore: DictationStore
+    var hushModel: AppModel?
+    var hushBridge: HushMuesliBridge?
     private let meetingHookDispatcher: MeetingHookDispatching
     private let meetingMarkdownAutoExporter: MeetingMarkdownAutoExporting
     private let launchAtLoginCoordinator: LaunchAtLoginCoordinator
@@ -474,6 +476,7 @@ public final class MuesliController: NSObject {
     private var busyStatusGeneration = 0
 
     let appState = AppState()
+    var hushPresentationWindow: NSWindow? { historyWindowController?.presentationWindow }
 
     private(set) var config: AppConfig
     private(set) var selectedBackend: BackendOption
@@ -488,6 +491,9 @@ public final class MuesliController: NSObject {
         return capture.session
     }
     private var activeMeetingID: Int64? {
+        if let model = hushModel, let uuid = model.recordingMeetingID {
+            return hushBridge?.nativeID(for: uuid)
+        }
         guard let capture = meetingCapture, !capture.session.capturePhase.isEnding else { return nil }
         return capture.id
     }
@@ -720,6 +726,15 @@ public final class MuesliController: NSObject {
     func start() {
         hasStarted = true
         MuesliController.current = self
+        if hushModel?.testMode == true {
+            // Real native dashboard, without touching the user's permission,
+            // calendar, model-download, or background-sync state.
+            historyWindowController = RecentHistoryWindowController(store: dictationStore, controller: self)
+            preferencesWindowController = PreferencesWindowController(controller: self)
+            syncAppState()
+            historyWindowController?.show()
+            return
+        }
         do {
             try dictationStore.migrateIfNeeded()
             try dictationStore.markRunningComputerUseTracesInterrupted()
@@ -731,8 +746,9 @@ public final class MuesliController: NSObject {
         normalizeMeetingTranscriptionSelectionForAvailability()
         SoundController.prewarmLifecycleSounds()
 
-        // Clean up phantom aggregate devices left by a previous crash
-        CoreAudioSystemRecorder.cleanupStaleDevices()
+        // Hush tears down only its verified creation-owned devices; display names
+        // are not authority to collect another process's aggregates at startup.
+        if hushModel == nil { CoreAudioSystemRecorder.cleanupStaleDevices() }
 
         syncLaunchAtLoginConfigWithSystem()
         reconcilePendingDictionaryCorrectionAccessibilityEnable()
@@ -922,6 +938,11 @@ public final class MuesliController: NSObject {
         }
         meetingMonitor.recordingLifecycleProvider = { [weak self] in
             guard let self else { return .idle }
+            if let model = self.hushModel {
+                return MeetingRecordingLifecycleSnapshot(
+                    phase: model.recording ? (model.recordingPaused ? .paused : .capturing) : .stopped,
+                    sessionID: self.activeMeetingID, autoStopSource: self.activeMeetingAutoStop.source)
+            }
             return MeetingRecordingLifecycleSnapshot(
                 phase: self.meetingCapture?.session.capturePhase ?? .stopped,
                 sessionID: self.meetingCapture?.id,
@@ -990,7 +1011,8 @@ public final class MuesliController: NSObject {
                         meetingHelperTrigger: .appLaunch
                     )
                 }
-                if includesMeetings, self.selectedMeetingTranscriptionBackend != self.selectedBackend {
+                if includesMeetings, self.selectedMeetingTranscriptionBackend != self.selectedBackend,
+                   self.selectedMeetingTranscriptionBackend.backend != BackendOption.nearAI.backend {
                     await self.transcriptionCoordinator.preload(
                         backend: self.selectedMeetingTranscriptionBackend,
                         enablePostProcessor: false,
@@ -1004,7 +1026,9 @@ public final class MuesliController: NSObject {
             }
         }
 
-        if !canRunMainApp {
+        if hushModel != nil {
+            openHistoryWindow()
+        } else if !canRunMainApp {
             if let progress = OnboardingProgress.load() {
                 showOnboarding(resumeFrom: progress)
             } else if config.hasCompletedOnboarding {
@@ -1039,6 +1063,10 @@ public final class MuesliController: NSObject {
     }
 
     func shutdown() async {
+        if hushModel?.testMode == true {
+            historyWindowController?.close()
+            return
+        }
         await cancelMeetingRetranscriptionsForShutdown()
         systemPermissionGuideController.dismiss()
         if let workspaceObserver {
@@ -1453,9 +1481,10 @@ public final class MuesliController: NSObject {
         refreshICloudBridgeStateForConfig()
         // Keep appState in sync with persisted hidden event IDs
         let persisted = Set(config.hiddenCalendarEventIDs)
-        if appState.hiddenCalendarEventIDs != persisted {
+        if hushModel == nil, appState.hiddenCalendarEventIDs != persisted {
             appState.hiddenCalendarEventIDs = persisted
         }
+        hushBridge?.syncLiveState()
     }
 
     func recoverStaleLiveMeetings() {
@@ -1493,6 +1522,12 @@ public final class MuesliController: NSObject {
         searchTask?.cancel()
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         appState.searchQuery = trimmed
+        if !trimmed.isEmpty {
+            appState.meetingsNavigationState = .browser
+            appState.selectedMeetingID = nil
+            appState.selectedMeetingRecord = nil
+        }
+        appState.hushSearchError = nil
         guard !trimmed.isEmpty else {
             appState.searchResultDictations = []
             appState.searchResultMeetings = []
@@ -1507,13 +1542,35 @@ public final class MuesliController: NSObject {
                 let m = (try? store.searchMeetings(query: trimmed)) ?? []
                 return (d, m)
             }.value
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled, let self, self.appState.searchQuery == trimmed else { return }
             self.appState.searchResultDictations = dictations
             self.appState.searchResultMeetings = meetings
+            guard let model = self.hushModel else { return }
+            do {
+                let secureResults = try await model.search(trimmed)
+                guard !Task.isCancelled, self.appState.searchQuery == trimmed else { return }
+                let mappings = try store.hushMeetingMappings()
+                let projected = try secureResults.compactMap { meeting -> MeetingRecord? in
+                    guard let id = mappings[meeting.id] else { return nil }
+                    return try store.meeting(id: id)
+                }
+                var seen = Set<Int64>()
+                self.appState.searchResultMeetings = (projected + meetings).filter { seen.insert($0.id).inserted }
+            } catch {
+                guard !Task.isCancelled, self.appState.searchQuery == trimmed else { return }
+                let message = "Semantic search is unavailable: \(error.localizedDescription). Local matches remain visible; check Privacy and inference settings."
+                self.appState.hushSearchError = message
+                model.error = message
+            }
         }
     }
 
+    func waitForHushSearch() async {
+        await searchTask?.value
+    }
+
     func clearSearch() {
+        appState.hushSearchError = nil
         searchTask?.cancel()
         appState.searchQuery = ""
         appState.searchResultDictations = []
@@ -1525,6 +1582,7 @@ public final class MuesliController: NSObject {
         dictationBackend: BackendOption,
         downloadedOptions: [BackendOption] = BackendOption.downloaded
     ) -> BackendOption? {
+        if config.meetingTranscriptionBackend == BackendOption.nearAI.backend { return .nearAI }
         let meetingOptions = downloadedOptions.filter(\.supportsMeetingTranscription)
         let fallback = dictationBackend.supportsMeetingTranscription ? dictationBackend : nil
         return BackendOption.resolveDownloaded(
@@ -1648,9 +1706,9 @@ public final class MuesliController: NSObject {
             config.postProcessorBackend = TranscriptCleanupBackendOption.local.backend
             config.enablePostProcessor = false
         }
-        let configuredMeetingTranscriptionBackend = BackendOption.all.first(where: {
-            $0.backend == config.meetingTranscriptionBackend && $0.model == config.meetingTranscriptionModel
-        })
+        let configuredMeetingTranscriptionBackend = BackendOption.resolve(
+            backend: config.meetingTranscriptionBackend, model: config.meetingTranscriptionModel
+        )
         selectedMeetingTranscriptionBackend = Self.availableMeetingTranscriptionBackend(
             config: config,
             dictationBackend: selectedBackend
@@ -1709,6 +1767,12 @@ public final class MuesliController: NSObject {
     /// leaves fullscreen chrome following the OS theme instead of the app's.
     /// Also refreshes the dashboard window's own appearance.
     func applyAppThemeAppearance() {
+        if hushModel != nil {
+            let appearance = appState.hushAppearance
+            NSApp?.appearance = appearance.appKit
+            historyWindowController?.presentationWindow?.appearance = appearance.appKit
+            return
+        }
         // NSApp is an implicitly unwrapped optional and is nil under `swift test`, where no
         // NSApplication is ever created. Touching it there traps and takes the whole test
         // bundle down, so bind it rather than forcing it.
@@ -1725,6 +1789,13 @@ public final class MuesliController: NSObject {
         hotkeyTriggerThresholdChanged: Bool,
         iCloudDisableCompletionStatus: String? = nil
     ) {
+        if hushModel?.testMode == true {
+            // Explicit native model smoke still prepares through the real
+            // coordinator; config changes must not start calendar/TCC monitors.
+            syncAppState()
+            applyAppThemeAppearance()
+            return
+        }
         statusBarController?.refresh()
         statusBarController?.refreshIcon()
         indicator.refreshIcon()
@@ -2983,6 +3054,11 @@ public final class MuesliController: NSObject {
     }
 
     func selectDictationProvider(_ provider: DictationProvider) {
+        guard canUseDictationProvider(provider) else {
+            presentErrorAlert(title: "Provider unavailable",
+                message: "Hush dictation uses local models. This hosted provider is outside the verified inference policy.")
+            return
+        }
         guard provider != selectedDictationProvider else { return }
         guard canChangePrimaryDictationModel() else { return }
         updateConfig { $0.dictationProvider = provider.rawValue }
@@ -3126,7 +3202,7 @@ public final class MuesliController: NSObject {
             normalizeMeetingTranscriptionSelectionForAvailability()
             return
         }
-        guard !requireDownloaded || option.isDownloaded else {
+        guard option.backend == BackendOption.nearAI.backend || !requireDownloaded || option.isDownloaded else {
             presentErrorAlert(
                 title: "Meeting model unavailable",
                 message: "Download \(option.label) before using it for meeting transcription."
@@ -3154,6 +3230,7 @@ public final class MuesliController: NSObject {
             $0.meetingTranscriptionModel = option.model
         }
         activeMeetingSession?.updateBackend(option)
+        if option.backend == BackendOption.nearAI.backend { return }
         Task { [weak self] in
             guard let self else { return }
             await self.transcriptionCoordinator.preload(
@@ -5449,6 +5526,7 @@ public final class MuesliController: NSObject {
     }
 
     private func ensureBasicDictationPermissionsBeforeDashboard() -> Bool {
+        if hushModel != nil { return true }
         guard hasRequiredStartupPermissions(for: config.resolvedOnboardingUseCase) else {
             historyWindowController?.close()
             if let progress = OnboardingProgress.load() {
@@ -5476,6 +5554,7 @@ public final class MuesliController: NSObject {
     }
 
     func showMeetingsHome(folderID: Int64? = nil) {
+        hushModel?.screen = .home
         appState.selectedTab = .meetings
         appState.selectedFolderID = folderID
         appState.meetingsNavigationState = .browser
@@ -5483,6 +5562,7 @@ public final class MuesliController: NSObject {
     }
 
     func showTimelineHome() {
+        hushModel?.screen = .home
         appState.selectedTab = .timeline
         appState.meetingsNavigationState = .browser
         appState.selectedMeetingID = nil
@@ -5490,6 +5570,7 @@ public final class MuesliController: NSObject {
     }
 
     func showMeetingDocument(id: Int64) {
+        hushBridge?.selectNativeMeeting(id: id)
         appState.selectedTab = .meetings
         appState.meetingDetailReturnDestination = .meetings
         appState.selectedMeetingID = id
@@ -5498,6 +5579,7 @@ public final class MuesliController: NSObject {
     }
 
     func showTimelineMeetingDocument(id: Int64) {
+        hushBridge?.selectNativeMeeting(id: id)
         appState.selectedTab = .timeline
         appState.meetingDetailReturnDestination = .timeline
         appState.selectedMeetingID = id
@@ -5538,6 +5620,7 @@ public final class MuesliController: NSObject {
     }
 
     @objc func focusSearchField() {
+        appState.hushSidebarCollapsed = false
         guard ensureBasicDictationPermissionsBeforeDashboard() else { return }
         presentHistoryWindow()
         DispatchQueue.main.async { [weak self] in
@@ -5699,6 +5782,8 @@ public final class MuesliController: NSObject {
     }
 
     func canUseSummaryProvider(_ provider: MeetingSummaryBackendOption, config summaryConfig: AppConfig? = nil) -> Bool {
+        if hushModel != nil, !HushInferencePolicy.permits(backend: provider.backend, config: summaryConfig ?? config) { return false }
+        if provider.backend == "near_ai" { return hushModel != nil }
         let summaryConfig = summaryConfig ?? config
         switch provider {
         case .chatGPT: return appState.isChatGPTAuthenticated
@@ -5743,6 +5828,7 @@ public final class MuesliController: NSObject {
             return
         }
         let openRouterKey = openRouterAuth.resolvedAPIKey(legacyAPIKey: summaryConfig.openRouterAPIKey)
+        let secureSnapshot = hushBridge?.secureMeeting(id: meeting.id)
         Task { [weak self] in
             guard let self else { return }
             let plan = MeetingResummarizationPolicy.plan(for: meeting)
@@ -5756,11 +5842,18 @@ public final class MuesliController: NSObject {
                     existingNotes: self.notesContextForResummary(meeting),
                     manualNotesToRetain: meeting.manualNotes,
                     participantNames: participantNames,
+                    previousMeetingNotes: meeting.followUpToID.flatMap { self.meeting(id: $0) }
+                        .flatMap { MeetingFollowUpPolicy.carriedContext(from: $0) },
                     openRouterAPIKeyOverride: openRouterKey
                 )
+                if let bridge = self.hushBridge, secureSnapshot != nil {
+                    try await bridge.saveSummary(source: meeting, snapshot: secureSnapshot, notes: notes, embed: provider.backend == "near_ai")
+                }
+                let persistedTitle = secureSnapshot == nil ? plan.persistedTitle
+                    : self.meeting(id: meeting.id)?.title ?? plan.persistedTitle
                 try self.dictationStore.updateMeetingSummary(
                     id: meeting.id,
-                    title: plan.persistedTitle,
+                    title: persistedTitle,
                     formattedNotes: notes,
                     selectedTemplateID: templateSnapshot.id,
                     selectedTemplateName: templateSnapshot.name,
@@ -6169,6 +6262,7 @@ public final class MuesliController: NSObject {
     }
 
     func updateMeetingTitle(id: Int64, title: String) {
+        if hushBridge?.edit(id: id, change: { $0.title = title }) == true { return }
         liveMeetingTitleCache[id] = title
         do {
             try dictationStore.updateMeetingTitle(id: id, title: title)
@@ -6181,16 +6275,41 @@ public final class MuesliController: NSObject {
     }
 
     func cacheMeetingTitle(id: Int64, title: String) {
+        if hushBridge?.edit(id: id, change: { $0.title = title }) == true { return }
         liveMeetingTitleCache[id] = title
     }
 
     func updateMeetingNotes(id: Int64, notes: String) {
+        if hushBridge?.edit(id: id, change: { $0.summary = notes }) == true { return }
         try? dictationStore.updateMeetingNotes(id: id, formattedNotes: notes)
         scheduleICloudSyncAfterLocalChange()
         syncAppState()
     }
 
     func updateMeetingTranscript(id: Int64, transcript: String) {
+        if let source = hushBridge?.secureMeeting(id: id), HushMuesliBridge.transcript(source) == transcript { return }
+        if hushBridge?.edit(id: id, change: { meeting in
+            let messages = TranscriptChatMessage.messages(from: transcript)
+            let original = meeting.segments
+            var revised = original
+            for (index, message) in messages.enumerated() {
+                let old = original.indices.contains(index) ? original[index] : nil
+                let components = message.timestamp?.split(separator: ":").compactMap { Double($0) } ?? []
+                let start = components.count == 2 ? components[0] * 60 + components[1] : old?.start ?? 0
+                let channel: AudioChannel = message.speaker == nil ? old?.channel ?? .me : (message.isUser ? .me : .them)
+                let segment = TranscriptSegment(id: old?.id ?? UUID(), chunkID: old?.chunkID ?? UUID(),
+                    channel: channel, start: start, end: max(old?.end ?? start, start), text: message.text)
+                if revised.indices.contains(index) { revised[index] = segment }
+                else { revised.append(segment) }
+            }
+            for index in original.indices.dropFirst(messages.count) {
+                let old = original[index]
+                revised[index] = TranscriptSegment(id: old.id, chunkID: old.chunkID, channel: old.channel,
+                    start: old.start, end: old.end, text: "")
+            }
+            meeting.segments = revised
+            meeting.embeddings = []
+        }) == true { return }
         do {
             try dictationStore.updateMeetingTranscript(id: id, rawTranscript: transcript)
             scheduleICloudSyncAfterLocalChange()
@@ -6201,6 +6320,7 @@ public final class MuesliController: NSObject {
     }
 
     func updateMeetingManualNotes(id: Int64, notes: String) {
+        if hushBridge?.edit(id: id, change: { $0.scratchNotes = notes }) == true { return }
         liveManualNotesPersistWorkItems[id]?.cancel()
         liveManualNotesPersistWorkItems[id] = nil
         liveManualNotesCache[id] = notes
@@ -6215,6 +6335,7 @@ public final class MuesliController: NSObject {
     }
 
     func cacheMeetingManualNotes(id: Int64, notes: String) {
+        if hushBridge?.edit(id: id, change: { $0.scratchNotes = notes }) == true { return }
         liveManualNotesCache[id] = notes
         scheduleCachedMeetingManualNotesPersistence(id: id)
     }
@@ -6408,6 +6529,10 @@ public final class MuesliController: NSObject {
     }
 
     func hideCalendarEvent(_ event: UnifiedCalendarEvent) {
+        if hushModel != nil {
+            appState.hiddenCalendarEventIDs.insert(event.id)
+            return
+        }
         appState.hiddenCalendarEventIDs.insert(event.id)
         updateConfig {
             $0.hiddenCalendarEventIDs = self.appState.hiddenCalendarEventIDs.sorted()
@@ -6417,6 +6542,19 @@ public final class MuesliController: NSObject {
     }
 
     func createMeetingFromCalendarEvent(_ event: UnifiedCalendarEvent, folderID: Int64?) {
+        if let model = hushModel {
+            do {
+                let meeting = Meeting(title: event.title)
+                try model.save(meeting)
+                model.screen = .meeting
+                if let nativeID = hushBridge?.nativeID(for: meeting.id) {
+                    try dictationStore.configureHushMeetingContext(id: nativeID, folderID: folderID,
+                        followUpToID: nil, calendarOccurrence: nil)
+                    syncAppState()
+                }
+            } catch { model.error = error.localizedDescription }
+            return
+        }
         let occurrence = event.resolvedCalendarOccurrence
         // Calendar placeholders are idempotent per occurrence. Recordings are
         // intentionally not: users may record the same occurrence more than once.
@@ -6549,6 +6687,7 @@ public final class MuesliController: NSObject {
     }
 
     func deleteMeeting(id: Int64) {
+        if hushBridge?.delete(id: id) == true { return }
         guard let meeting = meeting(id: id) else { return }
         guard canDeleteMeeting(meeting) else { return }
 
@@ -6620,6 +6759,13 @@ public final class MuesliController: NSObject {
     }
 
     func clearMeetingHistory() {
+        if let model = hushModel {
+            guard !model.recording, !model.busy else { return }
+            do {
+                for meeting in model.meetings { model.selectedID = meeting.id; try model.deleteSelected() }
+            } catch { model.error = error.localizedDescription }
+            return
+        }
         guard !isMeetingRecording(), !isStartingMeetingRecording, backgroundMeetingProcessingCount == 0 else {
             presentErrorAlert(
                 title: "Couldn't Clear Meeting History",
@@ -6652,11 +6798,13 @@ public final class MuesliController: NSObject {
     }
 
     public func isMeetingRecording() -> Bool {
-        activeMeetingSession?.isRecording == true || isStoppingMeetingRecording
+        if let hushModel { return hushModel.recording }
+        return activeMeetingSession?.isRecording == true || isStoppingMeetingRecording
     }
 
     func isMeetingRecordingPaused() -> Bool {
-        activeMeetingSession?.isPaused == true
+        if let hushModel { return hushModel.recordingPaused }
+        return activeMeetingSession?.isPaused == true
     }
 
     private var meetingTerminationState: MeetingTerminationState {
@@ -6758,6 +6906,11 @@ public final class MuesliController: NSObject {
     }
 
     @objc func toggleMeetingRecordingPause() {
+        if let hushModel {
+            hushModel.toggleRecordingPause()
+            hushBridge?.syncLiveState()
+            return
+        }
         if isMeetingRecordingPaused() {
             resumeMeetingRecording()
         } else {
@@ -6863,6 +7016,20 @@ public final class MuesliController: NSObject {
         inheritedFolderID: Int64? = nil,
         previousMeetingNotes: String? = nil
     ) -> Bool {
+        if let model = hushModel {
+            guard !model.recording, !model.busy else { return false }
+            model.run {
+                try await model.startRecording(title: title)
+                if let uuid = model.recordingMeetingID, let nativeID = self.hushBridge?.nativeID(for: uuid) {
+                    try self.dictationStore.configureHushMeetingContext(id: nativeID, folderID: inheritedFolderID,
+                        followUpToID: followUpToID, calendarOccurrence: nil)
+                    self.scheduleMeetingEndNotification(endDate: endDate, title: title)
+                    self.syncAppState()
+                }
+            }
+            openHistoryWindow()
+            return true
+        }
         guard ensureNoMeetingRetranscription() else { return false }
         guard !isMeetingRecording(), !isStartingMeetingRecording else { return false }
         guard let meetingBackend = normalizeMeetingTranscriptionSelectionForAvailability() else {
@@ -7143,6 +7310,13 @@ public final class MuesliController: NSObject {
 
     /// Presents a file picker and imports an audio file for offline transcription.
     func importAudioFile() {
+        if let model = hushModel {
+            Task { @MainActor in
+                guard let url = await AudioFileImportController.selectFile() else { return }
+                model.run { try await model.importAudio(url, title: url.deletingPathExtension().lastPathComponent) }
+            }
+            return
+        }
         guard ensureNoMeetingRetranscription() else { return }
         guard !isMeetingRecording(), !isStartingMeetingRecording, appState.modelFileMutationCount == 0 else { return }
         guard normalizeMeetingTranscriptionSelectionForAvailability() != nil else {
@@ -7171,6 +7345,10 @@ public final class MuesliController: NSObject {
 
     /// Imports an audio file from a URL (drag-and-drop or file picker).
     func importAudioFileFromURL(_ url: URL) {
+        if let model = hushModel {
+            model.run { try await model.importAudio(url, title: url.deletingPathExtension().lastPathComponent) }
+            return
+        }
         guard ensureNoMeetingRetranscription() else { return }
         guard !isMeetingRecording(), !isStartingMeetingRecording, appState.modelFileMutationCount == 0 else { return }
         guard AudioFileImportController.isSupportedFileURL(url) else {
@@ -7742,6 +7920,20 @@ public final class MuesliController: NSObject {
     }
 
     @objc func discardMeetingWithConfirmation() {
+        if let model = hushModel {
+            guard let recordingID = model.recordingMeetingID else { return }
+            let alert = NSAlert()
+            alert.messageText = "Discard recording?"
+            alert.informativeText = "Stop capture and delete this meeting and its encrypted audio?"
+            alert.addButton(withTitle: "Discard")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            Task { @MainActor in
+                do { try await self.discardHushRecording(id: recordingID) }
+                catch { model.error = error.localizedDescription }
+            }
+            return
+        }
         NSApp.activate(ignoringOtherApps: true)
 
         let alert = NSAlert()
@@ -8094,6 +8286,16 @@ public final class MuesliController: NSObject {
     }
 
     func stopMeetingRecording() {
+        if let model = hushModel {
+            meetingEndTimer?.invalidate()
+            meetingEndTimer = nil
+            meetingNotification.close()
+            Task { @MainActor in
+                do { try await model.stopRecording() }
+                catch { model.error = error.localizedDescription }
+            }
+            return
+        }
         meetingRecordingHotkeyMonitor.cancelToggleMode()
         guard let sessionToStop = activeMeetingSession else { return }
         meetingStartAttempt?.task.cancel()
@@ -11044,6 +11246,11 @@ public final class MuesliController: NSObject {
     /// The recorder still writes its WAV so a network failure can fall back locally.
     private func beginHostedDictationIfNeeded() -> Bool {
         guard !isDictationTestMode, selectedDictationProvider.isHosted else { return true }
+        guard canUseDictationProvider(selectedDictationProvider) else {
+            presentErrorAlert(title: "Provider unavailable",
+                message: "Choose a local dictation model. This hosted provider is outside Hush's verified inference policy.")
+            return false
+        }
         cancelHostedDictation()
 
         let session: any HostedDictationSession

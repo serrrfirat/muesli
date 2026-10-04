@@ -1,6 +1,6 @@
 import Foundation
 import CloudKit
-import SQLite3
+import CSQLCipher
 import Testing
 import MuesliCore
 @testable import MuesliNativeApp
@@ -81,7 +81,7 @@ struct MeetingFollowUpThreadTests {
     private func makeStore() throws -> DictationStore {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("muesli-followup-test-\(UUID().uuidString).db")
-        let store = DictationStore(databaseURL: url)
+        let store = configuredTestStore(databaseURL: url)
         try store.migrateIfNeeded()
         return store
     }
@@ -90,7 +90,7 @@ struct MeetingFollowUpThreadTests {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("muesli-followup-legacy-test-\(UUID().uuidString).db")
         var db: OpaquePointer?
-        guard sqlite3_open(url.path, &db) == SQLITE_OK else {
+        guard openEncryptedTestDatabase(url.path, &db) == SQLITE_OK else {
             throw NSError(domain: "MeetingFollowUpTests", code: 1)
         }
         defer { sqlite3_close(db) }
@@ -125,7 +125,7 @@ struct MeetingFollowUpThreadTests {
         guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
             throw NSError(domain: "MeetingFollowUpTests", code: 2)
         }
-        return DictationStore(databaseURL: url)
+        return configuredTestStore(databaseURL: url)
     }
 
     @discardableResult
@@ -147,7 +147,7 @@ struct MeetingFollowUpThreadTests {
 
     private func tableColumns(_ table: String, store: DictationStore) throws -> Set<String> {
         var db: OpaquePointer?
-        guard sqlite3_open(store.resolvedDatabaseURL.path, &db) == SQLITE_OK else {
+        guard openEncryptedTestDatabase(store.resolvedDatabaseURL.path, &db) == SQLITE_OK else {
             throw NSError(domain: "MeetingFollowUpTests", code: 1)
         }
         defer { sqlite3_close(db) }
@@ -169,7 +169,7 @@ struct MeetingFollowUpThreadTests {
 
     private func indexNames(_ table: String, store: DictationStore) throws -> Set<String> {
         var db: OpaquePointer?
-        guard sqlite3_open(store.resolvedDatabaseURL.path, &db) == SQLITE_OK else {
+        guard openEncryptedTestDatabase(store.resolvedDatabaseURL.path, &db) == SQLITE_OK else {
             throw NSError(domain: "MeetingFollowUpTests", code: 1)
         }
         defer { sqlite3_close(db) }
@@ -377,7 +377,7 @@ struct MeetingFollowUpThreadTests {
         let followUpID = try makeMeeting(store, title: "Follow-up", followUpToID: rootID)
 
         var db: OpaquePointer?
-        guard sqlite3_open(store.resolvedDatabaseURL.path, &db) == SQLITE_OK else {
+        guard openEncryptedTestDatabase(store.resolvedDatabaseURL.path, &db) == SQLITE_OK else {
             throw NSError(domain: "MeetingFollowUpTests", code: 1)
         }
         let triggerSQL = """
@@ -423,7 +423,7 @@ struct MeetingFollowUpThreadTests {
         let followUpID = try makeMeeting(store, title: "Follow-up", followUpToID: rootID)
 
         var db: OpaquePointer?
-        guard sqlite3_open(store.resolvedDatabaseURL.path, &db) == SQLITE_OK else {
+        guard openEncryptedTestDatabase(store.resolvedDatabaseURL.path, &db) == SQLITE_OK else {
             throw NSError(domain: "MeetingFollowUpTests", code: 1)
         }
         let setupSQL = """
@@ -450,7 +450,7 @@ struct MeetingFollowUpThreadTests {
         let followUp = try #require(try store.meeting(id: followUpID))
         #expect(followUp.followUpToID == rootID)
 
-        guard sqlite3_open(store.resolvedDatabaseURL.path, &db) == SQLITE_OK else {
+        guard openEncryptedTestDatabase(store.resolvedDatabaseURL.path, &db) == SQLITE_OK else {
             throw NSError(domain: "MeetingFollowUpTests", code: 3)
         }
         defer { sqlite3_close(db) }

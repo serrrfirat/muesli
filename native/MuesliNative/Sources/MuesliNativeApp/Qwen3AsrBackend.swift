@@ -124,10 +124,18 @@ actor Qwen3AsrTranscriber {
     /// Returns the transcribed text (no token-level timings available).
     /// `language` is an optional ISO code; nil keeps automatic language detection.
     func transcribe(wavURL: URL, language: String? = nil) async throws -> (text: String, processingTime: Double) {
-        guard let manager else { throw TranscriberError.notLoaded }
+        guard manager != nil else { throw TranscriberError.notLoaded }
         let start = CFAbsoluteTimeGetCurrent()
         let converter = AudioConverter()
         let samples = try converter.resampleAudioFile(wavURL)
+        let result = try await transcribe(samples: samples, language: language)
+        return (result.text, CFAbsoluteTimeGetCurrent() - start)
+    }
+
+    /// Transcribe 16 kHz mono samples, preserving automatic or pinned language selection.
+    func transcribe(samples: [Float], language: String? = nil) async throws -> (text: String, processingTime: Double) {
+        guard let manager else { throw TranscriberError.notLoaded }
+        let start = CFAbsoluteTimeGetCurrent()
         let text = try await manager.transcribe(audioSamples: samples, language: language)
         let processingTime = CFAbsoluteTimeGetCurrent() - start
         return (text, processingTime)

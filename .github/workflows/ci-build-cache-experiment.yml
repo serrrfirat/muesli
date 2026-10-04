@@ -37,6 +37,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Install native crypto libraries
+        run: brew install libsodium sqlcipher
       - name: Test benchmark harness
         run: python3 scripts/test_ci_cache_experiment.py
       - name: Identify toolchain and cache
@@ -85,6 +87,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Install native crypto libraries
+        run: brew install libsodium sqlcipher
       - name: Identify toolchain and cache
         id: prepare
         run: python3 scripts/ci_cache_experiment.py prepare "${SCENARIO}"

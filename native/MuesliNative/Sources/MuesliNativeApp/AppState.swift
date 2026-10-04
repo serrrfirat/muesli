@@ -4,6 +4,7 @@ import MuesliCore
 
 enum DashboardTab: String, CaseIterable {
     case timeline
+    case chat
     case dictations
     case insights
     case meetings
@@ -152,6 +153,10 @@ enum OpenRouterModelCatalogLoadState: Equatable {
 @MainActor
 @Observable
 final class AppState {
+    var hushAppearance = HushAppearance.system
+    var hushSidebarCollapsed = false
+    var hushSidebarWidth: CGFloat = 0
+    var hushSearchFocused = false
     // Dashboard data
     var timelineRows: [TimelineEntry] = []
     var dictationRows: [DictationRecord] = []
@@ -272,6 +277,7 @@ final class AppState {
 
     // Search
     var searchQuery: String = ""
+    var hushSearchError: String?
     var searchResultDictations: [DictationRecord] = []
     var searchResultMeetings: [MeetingRecord] = []
     var focusSearchField: Bool = false

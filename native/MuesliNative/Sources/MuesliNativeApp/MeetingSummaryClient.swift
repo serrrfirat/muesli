@@ -202,6 +202,7 @@ enum MeetingSummaryClient {
         previousMeetingNotes: String? = nil,
         openRouterAPIKeyOverride: String? = nil
     ) async throws -> String {
+        try await HushInferencePolicy.validate(backend: config.meetingSummaryBackend, config: config)
         let isClaudeCode = config.meetingSummaryBackend.lowercased() == MeetingSummaryBackendOption.claudeCode.backend
         return try await withSummaryRetries(
             maxRetries: config.meetingSummaryRetryCount,
@@ -298,6 +299,27 @@ enum MeetingSummaryClient {
                 visualContext: visualContext,
                 previousMeetingNotes: previousMeetingNotes,
                 apiKeyOverride: openRouterAPIKeyOverride
+            )
+            return notesByRetainingManualNotes(generatedNotes: generatedNotes, manualNotes: manualNotesToRetain)
+        }
+        if backend == MeetingSummaryBackendOption.nearAI.backend {
+            generatedNotes = try await HushNearAIProvider.complete(
+                systemPrompt: summaryInstructions(
+                    for: template,
+                    existingNotes: existingNotes,
+                    manualNotes: manualNotesToRetain,
+                    previousMeetingNotes: previousMeetingNotes
+                ),
+                userPrompt: summaryUserPrompt(
+                    transcript: transcript,
+                    meetingTitle: meetingTitle,
+                    existingNotes: existingNotes,
+                    manualNotes: manualNotesToRetain,
+                    participantNames: participantNames,
+                    visualContext: visualContext,
+                    previousMeetingNotes: previousMeetingNotes
+                ),
+                model: config.nearAIModel
             )
             return notesByRetainingManualNotes(generatedNotes: generatedNotes, manualNotes: manualNotesToRetain)
         }
@@ -1459,8 +1481,13 @@ enum MeetingSummaryClient {
         openRouterAPIKeyOverride: String? = nil
     ) async -> String? {
         let backend = (config.meetingSummaryBackend.isEmpty ? MeetingSummaryBackendOption.chatGPT.backend : config.meetingSummaryBackend).lowercased()
+        do { try await HushInferencePolicy.validate(backend: backend, config: config) }
+        catch { return nil }
 
         let excerpt = titlePrompt(transcript: transcript, manualNotes: manualNotes)
+        if backend == MeetingSummaryBackendOption.nearAI.backend {
+            return try? await HushNearAIProvider.complete(systemPrompt: titleInstructions, userPrompt: excerpt, model: config.nearAIModel)
+        }
 
         if backend == MeetingSummaryBackendOption.chatGPT.backend {
             return await generateTitleWithChatGPT(transcript: excerpt, config: config)

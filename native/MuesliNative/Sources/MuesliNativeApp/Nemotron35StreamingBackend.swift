@@ -192,7 +192,11 @@ actor Nemotron35StreamingTranscriber: NemotronStreamingTranscribing {
     func transcribe(wavURL: URL) async throws -> (text: String, processingTime: Double) {
         guard loaded else { throw TranscriberError.notLoaded }
 
-        let samples = try nemotronLoadWavAsFloats(url: wavURL)
+        return try await transcribe(samples: nemotronLoadWavAsFloats(url: wavURL))
+    }
+
+    func transcribe(samples: [Float]) async throws -> (text: String, processingTime: Double) {
+        guard loaded else { throw TranscriberError.notLoaded }
         let start = CFAbsoluteTimeGetCurrent()
 
         var state = try makeStreamState()

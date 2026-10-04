@@ -267,10 +267,26 @@ actor BodhanTranscriber {
     func transcribe(wavURL: URL, modelID: String = BodhanModel.flex.rawValue,
                     language: BodhanLanguage = .defaultLanguage, outputMode: BodhanOutputMode = .mixed) async throws -> (text: String, processingTime: Double) {
         try await prepare(modelID: modelID)
-        guard let runtime, let model else { throw CancellationError() }
-        let language = language.supported(for: modelID)
+        guard runtime != nil, model != nil else { throw CancellationError() }
         let start = CFAbsoluteTimeGetCurrent()
         let samples = try AudioConverter().resampleAudioFile(wavURL)
+        return try transcribePrepared(samples: samples, modelID: modelID, language: language,
+            outputMode: outputMode, start: start)
+    }
+
+    /// Transcribe 16 kHz mono samples with the selected Bodhan model and output mode.
+    func transcribe(samples: [Float], modelID: String = BodhanModel.flex.rawValue,
+                    language: BodhanLanguage = .defaultLanguage, outputMode: BodhanOutputMode = .mixed) async throws -> (text: String, processingTime: Double) {
+        try await prepare(modelID: modelID)
+        return try transcribePrepared(samples: samples, modelID: modelID, language: language,
+            outputMode: outputMode, start: CFAbsoluteTimeGetCurrent())
+    }
+
+    private func transcribePrepared(samples: [Float], modelID: String,
+                                   language: BodhanLanguage, outputMode: BodhanOutputMode,
+                                   start: CFAbsoluteTime) throws -> (text: String, processingTime: Double) {
+        guard let runtime, model != nil else { throw CancellationError() }
+        let language = language.supported(for: modelID)
         guard !samples.isEmpty else { return ("", CFAbsoluteTimeGetCurrent() - start) }
         var transcripts: [String] = []
         var offset = 0

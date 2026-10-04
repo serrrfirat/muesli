@@ -11,43 +11,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var terminationTask: Task<Void, Never>?
     private(set) var updaterController: SPUStandardUpdaterController?
     private let sparkleUpdateDelegate = SparkleUpdateDelegate()
+    var e2eTerminationReply: ((Bool) -> Void)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installStandardEditMenu()
 
-        let runtimeTelemetry = TelemetryRuntimeConfiguration.current()
-        let telemetryConfig = TelemetryDeck.Config(appID: runtimeTelemetry.sdkAppID)
-        telemetryConfig.analyticsDisabled = !runtimeTelemetry.isEnabled
-        telemetryConfig.defaultParameters = { runtimeTelemetry.defaultParameters }
+        // Fork privacy policy: SDK calls throughout the upstream shell remain
+        // globally disabled, irrespective of environment or upstream defaults.
+        let telemetryConfig = TelemetryDeck.Config(appID: "00000000-0000-0000-0000-000000000000")
+        telemetryConfig.analyticsDisabled = true
         TelemetryDeck.initialize(config: telemetryConfig)
-        if runtimeTelemetry.isEnabled {
-            TelemetryDeck.signal("app.launched")
-        }
-        // Always drain a pending marker. TelemetryDeck's global privacy gate
-        // suppresses the signal when analytics are disabled.
-        DiarizerPreloadDiagnostics().reportInterruptedAttemptIfNeeded()
 
         do {
+            let options = LaunchOptions()
+            let root = AppIdentity.supportDirectoryURL
+            try MuesliPaths.configureRuntimeSupportDirectory(root)
+            let model = try AppModel(root: root, endpoint: options.endpoint, testMode: options.mock,
+                keychainVault: options.keychainVault, syntheticMicrophone: options.syntheticMicrophone)
+            let databaseURL = root.appendingPathComponent("muesli.db")
+            // Exercise the standalone intent/CLI lookup in a fresh process, without
+            // registering an in-memory key or changing the original Keychain item.
+            let unregisteredStore = options.e2e && options.keychainVault
+                && CommandLine.arguments.contains("--e2e-unregistered-store")
+            if !unregisteredStore {
+                try DictationStore.configureEncryption(key: model.vault.databaseEncryptionKey(), databaseURL: databaseURL)
+            }
             let runtime = try RuntimePaths.resolve()
             AppFonts.registerIfNeeded(runtime: runtime)
             if let appIcon = runtime.appIcon, let image = NSImage(contentsOf: appIcon) {
                 NSApplication.shared.applicationIconImage = image
             }
-            let controller = MuesliController(runtime: runtime)
+            let configStore = ConfigStore(supportDirectory: root)
+            if !FileManager.default.fileExists(atPath: configStore.configPath().path) {
+                var config = configStore.load()
+                config.meetingSummaryBackend = "near_ai"
+                configStore.save(config)
+            }
+            let controller = MuesliController(runtime: runtime,
+                dictationStore: DictationStore(databaseURL: databaseURL), configStore: configStore)
+            controller.hushBridge = try HushMuesliBridge(model: model, controller: controller)
             controller.applyAppThemeAppearance()
             sparkleUpdateDelegate.appState = controller.appState
-            if Self.hasConfiguredSparkleFeed {
-                let updaterController = SPUStandardUpdaterController(
-                    startingUpdater: true,
-                    updaterDelegate: sparkleUpdateDelegate,
-                    userDriverDelegate: sparkleUpdateDelegate
-                )
-                controller.updaterController = updaterController
-                self.updaterController = updaterController
-            }
+            // No upstream update feed is trusted by this fork.
             self.controller = controller
             controller.start()
-            NSApplication.shared.registerForRemoteNotifications()
+            if options.e2e { Task { await BinaryE2E(model: model, options: options).run() } }
         } catch {
             let alert = NSAlert()
             alert.messageText = "\(AppIdentity.displayName) failed to start"
@@ -79,15 +87,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if terminationTask != nil {
             return .terminateLater
         }
-        if controller?.shouldTerminateApplication() == false {
+        if controller?.hushModel == nil, controller?.shouldTerminateApplication() == false {
             return .terminateCancel
         }
         guard let controller else { return .terminateNow }
 
         terminationTask = Task { @MainActor [weak self] in
-            await controller.shutdown()
+            let allowed = await controller.hushModel?.prepareToQuit() ?? true
+            if allowed { await controller.shutdown() }
             self?.terminationTask = nil
-            sender.reply(toApplicationShouldTerminate: true)
+            sender.reply(toApplicationShouldTerminate: allowed)
+            self?.e2eTerminationReply?(allowed)
         }
         return .terminateLater
     }
@@ -133,6 +143,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc func focusSearch(_ sender: Any?) {
         controller?.focusSearchField()
+    }
+
+    @objc func toggleSidebar(_ sender: Any?) {
+        controller?.appState.hushSidebarCollapsed.toggle()
     }
 
     @objc func showWhatsNew(_ sender: Any?) {
@@ -256,7 +270,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let findItem = NSMenuItem(
             title: "Find",
             action: #selector(AppDelegate.focusSearch(_:)),
-            keyEquivalent: "f"
+            keyEquivalent: "k"
         )
         findItem.target = self
         editMenu.addItem(findItem)
@@ -266,6 +280,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         let viewMenuItem = NSMenuItem(title: "View", action: nil, keyEquivalent: "")
         let viewMenu = NSMenu(title: "View")
+        let sidebarItem = NSMenuItem(title: "Toggle Sidebar",
+            action: #selector(AppDelegate.toggleSidebar(_:)), keyEquivalent: "\\")
+        sidebarItem.target = self
+        viewMenu.addItem(sidebarItem)
         let dictationsItem = NSMenuItem(
             title: "Dictations",
             action: #selector(AppDelegate.showDictations(_:)),

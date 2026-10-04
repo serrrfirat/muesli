@@ -1265,17 +1265,43 @@ actor CohereTranscribeTranscriber {
         wavURL: URL,
         language: CohereTranscribeLanguage = CohereTranscribeLanguage.defaultLanguage
     ) async throws -> (text: String, processingTime: Double, profile: CohereProfilingSummary) {
+        let manager = try await preparedManager()
+        let start = CFAbsoluteTimeGetCurrent()
+        let converter = AudioConverter()
+        let resampleStart = CFAbsoluteTimeGetCurrent()
+        let samples = try converter.resampleAudioFile(wavURL)
+        let resampleMs = (CFAbsoluteTimeGetCurrent() - resampleStart) * 1000
+        return try await transcribePrepared(samples: samples, language: language, manager: manager,
+            start: start, resampleMs: resampleMs)
+    }
+
+    /// Transcribe 16 kHz mono samples without writing audio to disk.
+    func transcribe(
+        samples: [Float],
+        language: CohereTranscribeLanguage = CohereTranscribeLanguage.defaultLanguage
+    ) async throws -> (text: String, processingTime: Double, profile: CohereProfilingSummary) {
+        let manager = try await preparedManager()
+        return try await transcribePrepared(samples: samples, language: language, manager: manager,
+            start: CFAbsoluteTimeGetCurrent(), resampleMs: 0)
+    }
+
+    private func preparedManager() async throws -> CohereTranscribeManager {
         try await loadModels()
         if let warmupTask {
             CohereProfilingLog.write("[cohere] waiting for background warmup to finish before dictation...")
             await warmupTask.value
         }
         guard let manager else { throw TranscriberError.notLoaded }
-        let start = CFAbsoluteTimeGetCurrent()
-        let converter = AudioConverter()
-        let resampleStart = CFAbsoluteTimeGetCurrent()
-        let samples = try converter.resampleAudioFile(wavURL)
-        let resampleMs = (CFAbsoluteTimeGetCurrent() - resampleStart) * 1000
+        return manager
+    }
+
+    private func transcribePrepared(
+        samples: [Float],
+        language: CohereTranscribeLanguage,
+        manager: CohereTranscribeManager,
+        start: CFAbsoluteTime,
+        resampleMs: Double
+    ) async throws -> (text: String, processingTime: Double, profile: CohereProfilingSummary) {
         let inference = try await manager.transcribe(audioSamples: samples, language: language)
         let processingTime = CFAbsoluteTimeGetCurrent() - start
         var profile = inference.profile

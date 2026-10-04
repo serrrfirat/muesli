@@ -52,6 +52,11 @@ struct DashboardContentLayout<SidebarContent: View, DetailContent: View>: View {
     }
 }
 
+private struct HushSidebarWidthKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 struct DashboardRootView: View {
     let appState: AppState
     let controller: MuesliController
@@ -68,14 +73,18 @@ struct DashboardRootView: View {
         _sidebarPresentation = State(initialValue: sidebarPresentation)
     }
 
+    private var sidebarCollapsed: Bool {
+        controller.hushModel == nil ? sidebarPresentation.isCollapsed : appState.hushSidebarCollapsed
+    }
     var sidebarView: SidebarView {
         SidebarView(
             appState: appState,
             controller: controller,
-            isCollapsed: sidebarPresentation.isCollapsed,
+            isCollapsed: sidebarCollapsed,
             onToggleCollapsed: {
                 withAnimation(.easeInOut(duration: 0.22)) {
-                    sidebarPresentation.toggle()
+                    if controller.hushModel == nil { sidebarPresentation.toggle() }
+                    else { appState.hushSidebarCollapsed.toggle() }
                 }
             }
         )
@@ -91,10 +100,18 @@ struct DashboardRootView: View {
             DashboardContentLayout(usesCompactQuickNotes: usesCompactQuickNotes) {
                 sidebarView
                 .frame(
-                    minWidth: sidebarPresentation.isCollapsed ? 68 : 240,
-                    idealWidth: sidebarPresentation.isCollapsed ? 68 : 260,
-                    maxWidth: sidebarPresentation.isCollapsed ? 68 : 300
+                    minWidth: sidebarCollapsed ? 68 : 240,
+                    idealWidth: sidebarCollapsed ? 68 : 260,
+                    maxWidth: sidebarCollapsed ? 68 : 300
                 )
+                .background {
+                    GeometryReader { sidebarGeometry in
+                        Color.clear.preference(key: HushSidebarWidthKey.self, value: sidebarGeometry.size.width)
+                    }
+                }
+                .onPreferenceChange(HushSidebarWidthKey.self) { width in
+                    if abs(appState.hushSidebarWidth - width) > 0.5 { appState.hushSidebarWidth = width }
+                }
             } detail: {
                 detailContent
             }
@@ -103,7 +120,10 @@ struct DashboardRootView: View {
             minWidth: DashboardWindowLayout.minimumContentWidth,
             minHeight: DashboardWindowLayout.minimumContentHeight
         )
-        .preferredColorScheme(appState.config.darkMode ? .dark : .light)
+        .preferredColorScheme(controller.hushModel == nil ? (appState.config.darkMode ? .dark : .light) : appState.hushAppearance.colorScheme)
+        .overlay(alignment: .bottom) {
+            if let model = controller.hushModel { HushStatusView(model: model) }
+        }
         .onPreferenceChange(FeatureTourTargetPreferenceKey.self) { frames in
             guard FeatureTourFrameTracking.hasMeaningfulChange(
                 from: featureTourTargetFrames,
@@ -240,7 +260,14 @@ struct DashboardRootView: View {
         } else {
             switch appState.selectedTab {
             case .timeline:
-                TimelineView(appState: appState, controller: controller)
+                VStack(spacing: 0) {
+                    if let bridge = controller.hushBridge {
+                        HushUpcomingView(calendar: bridge.calendar, model: bridge.model)
+                    }
+                    TimelineView(appState: appState, controller: controller)
+                }
+            case .chat:
+                if let model = controller.hushModel { HushChatView(model: model) }
             case .dictations:
                 DictationsView(appState: appState, controller: controller)
             case .insights:
@@ -259,7 +286,11 @@ struct DashboardRootView: View {
             case .shortcuts:
                 ShortcutsView(appState: appState, controller: controller)
             case .settings:
-                SettingsView(appState: appState, controller: controller)
+                if let model = controller.hushModel {
+                    HushSettingsView(model: model, controller: controller)
+                } else {
+                    SettingsView(appState: appState, controller: controller)
+                }
             case .about:
                 AboutView(
                     appState: appState,

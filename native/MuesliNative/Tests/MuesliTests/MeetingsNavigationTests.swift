@@ -2,7 +2,7 @@ import Testing
 import AppKit
 import Foundation
 import MuesliCore
-import SQLite3
+import CSQLCipher
 @testable import MuesliNativeApp
 
 private enum OpenRouterDisconnectTestError: Error {
@@ -115,7 +115,7 @@ struct MeetingsNavigationTests {
     private func makeStore() throws -> DictationStore {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("muesli-nav-test-\(UUID().uuidString).db")
-        let store = DictationStore(databaseURL: url)
+        let store = configuredTestStore(databaseURL: url)
         try store.migrateIfNeeded()
         return store
     }
@@ -858,7 +858,7 @@ struct MeetingsNavigationTests {
         let store = try makeStore()
         let id = try store.createLiveMeeting(title: "Recoverable", calendarEventID: nil, startTime: Date())
         var db: OpaquePointer?
-        #expect(sqlite3_open(store.resolvedDatabaseURL.path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(store.resolvedDatabaseURL.path, &db) == SQLITE_OK)
         defer { sqlite3_close(db) }
         let sql = "CREATE TRIGGER fail_recording_path BEFORE UPDATE OF saved_recording_path ON meetings BEGIN SELECT RAISE(FAIL, 'injected path failure'); END;"
         #expect(sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK)
@@ -885,7 +885,7 @@ struct MeetingsNavigationTests {
         let id = try store.createLiveMeeting(title: "Recovery", calendarEventID: nil, startTime: Date())
         let meeting = try #require(try store.meeting(id: id))
         var db: OpaquePointer?
-        #expect(sqlite3_open(store.resolvedDatabaseURL.path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(store.resolvedDatabaseURL.path, &db) == SQLITE_OK)
         defer { sqlite3_close(db) }
         #expect(sqlite3_exec(db, "CREATE TRIGGER fail_path BEFORE UPDATE OF saved_recording_path ON meetings BEGIN SELECT RAISE(FAIL, 'injected'); END;", nil, nil, nil) == SQLITE_OK)
         do {
@@ -977,7 +977,7 @@ struct MeetingsNavigationTests {
         try controller.preserveMeetingRecordingReference(meeting: meeting, path: audio.path)
         let reference = MeetingRecordingRecoveryReference.url(for: audio)
         var db: OpaquePointer?
-        #expect(sqlite3_open(store.resolvedDatabaseURL.path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(store.resolvedDatabaseURL.path, &db) == SQLITE_OK)
         defer { sqlite3_close(db) }
         #expect(sqlite3_exec(db, "CREATE TRIGGER fail_path BEFORE UPDATE OF saved_recording_path ON meetings BEGIN SELECT RAISE(FAIL, 'injected'); END;", nil, nil, nil) == SQLITE_OK)
         controller.recoverRetainedMeetingRecordings()

@@ -13,7 +13,7 @@ struct DictationTestLifecycleTests {
         try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: supportDirectory) }
 
-        let store = DictationStore(databaseURL: supportDirectory.appendingPathComponent("muesli.db"))
+        let store = configuredTestStore(databaseURL: supportDirectory.appendingPathComponent("muesli.db"))
         try store.migrateIfNeeded()
         let controller = MuesliController(
             runtime: RuntimePaths(

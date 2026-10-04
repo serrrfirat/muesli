@@ -77,9 +77,18 @@ struct MuesliSettingControl: View {
 
     private func filteredSnapshot(_ setting: MuesliSetting) -> MuesliSetting.Snapshot {
         let state = setting.snapshot(config: controller.appState.config, source: .manualUI)
-        guard let allowedChoiceIDs else { return state }
+        var unavailable = state.unavailable
+        if id == "dictation_provider" {
+            for choice in state.choices {
+                if let provider = DictationProvider(rawValue: choice.id),
+                   !controller.canUseDictationProvider(provider) {
+                    unavailable[choice.id] = "Hush dictation stays on device. Unverified hosted transcription is disabled."
+                }
+            }
+        }
+        let choices = allowedChoiceIDs.map { allowed in state.choices.filter { allowed.contains($0.id) } } ?? state.choices
         return .init(id: state.id, label: state.label, current: state.current,
-            choices: state.choices.filter { allowedChoiceIDs.contains($0.id) }, unavailable: state.unavailable)
+            choices: choices, unavailable: unavailable)
     }
 
     private func apply(_ value: String) {

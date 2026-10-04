@@ -1,8 +1,14 @@
 import Foundation
-import SQLite3
+import CSQLCipher
 import Testing
 import MuesliCore
 @testable import MuesliCLI
+
+private func configuredTestCLIContext(dbPath: String?, supportDir: String?) -> CLIContext {
+    let context = CLIContext(dbPath: dbPath, supportDir: supportDir)
+    _ = configuredTestStore(databaseURL: context.databaseURL)
+    return context
+}
 
 @Suite("MuesliCLI", .serialized)
 struct MuesliCLITests {
@@ -33,7 +39,7 @@ struct MuesliCLITests {
 
     @Test("explicit db path overrides support directory resolution")
     func cliContextUsesExplicitDatabasePath() {
-        let context = CLIContext(
+        let context = configuredTestCLIContext(
             dbPath: "/tmp/custom-muesli.db",
             supportDir: "/tmp/ignored-support"
         )
@@ -44,7 +50,7 @@ struct MuesliCLITests {
 
     @Test("explicit support dir resolves the default db name inside it")
     func cliContextUsesExplicitSupportDirectory() {
-        let context = CLIContext(
+        let context = configuredTestCLIContext(
             dbPath: nil,
             supportDir: "/tmp/muesli-support"
         )
@@ -101,7 +107,7 @@ struct MuesliCLITests {
         // visual_context (mirrors makeLegacyStore in DictationStoreTests).
         let dbURL = dir.appendingPathComponent("muesli.db")
         var db: OpaquePointer?
-        #expect(sqlite3_open(dbURL.path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(dbURL.path, &db) == SQLITE_OK)
         let legacySQL = """
         CREATE TABLE meetings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,7 +128,7 @@ struct MuesliCLITests {
         #expect(sqlite3_exec(db, legacySQL, nil, nil, nil) == SQLITE_OK)
         sqlite3_close(db)
 
-        let context = CLIContext(dbPath: dbURL.path, supportDir: nil)
+        let context = configuredTestCLIContext(dbPath: dbURL.path, supportDir: nil)
         #expect(migrationWarnings(context).isEmpty)
         // The read would fail with "no such column" without the migration above.
         #expect(try context.store.recentMeetings(limit: 1).isEmpty)
@@ -138,7 +144,7 @@ struct MuesliCLITests {
         try? FileManager.default.createDirectory(at: dbURL, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        let warnings = migrationWarnings(CLIContext(dbPath: dbURL.path, supportDir: nil))
+        let warnings = migrationWarnings(configuredTestCLIContext(dbPath: dbURL.path, supportDir: nil))
         #expect(warnings.count == 1)
         #expect(warnings.first?.contains("Schema migration failed") == true)
     }
@@ -151,7 +157,7 @@ struct MuesliCLITests {
         try? FileManager.default.createDirectory(at: dbURL, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        let context = CLIContext(dbPath: dbURL.path, supportDir: nil)
+        let context = configuredTestCLIContext(dbPath: dbURL.path, supportDir: nil)
         #expect(throws: CLIError.self) {
             try withMigration(context) { try context.store.recentMeetings(limit: 1) }
         }
@@ -172,7 +178,7 @@ struct MuesliCLITests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        let context = CLIContext(dbPath: dir.appendingPathComponent("muesli.db").path, supportDir: nil)
+        let context = configuredTestCLIContext(dbPath: dir.appendingPathComponent("muesli.db").path, supportDir: nil)
         // A migration can fail against a schema that is already current (a busy
         // database while the app writes), where the read still succeeds. The
         // warning is the only signal the caller gets, so it must survive.
@@ -191,7 +197,7 @@ struct MuesliCLITests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        let context = CLIContext(dbPath: dir.appendingPathComponent("muesli.db").path, supportDir: nil)
+        let context = configuredTestCLIContext(dbPath: dir.appendingPathComponent("muesli.db").path, supportDir: nil)
         let (rows, warnings) = try withMigration(context) { try context.store.recentMeetings(limit: 5) }
         #expect(rows.isEmpty)
         #expect(warnings.isEmpty)
@@ -646,7 +652,7 @@ private struct TranscribeFixture {
         let samples = Array(repeating: Float(0.1), count: 16_000)
         try CLIWavWriter.writeWAV(samples: samples, to: sourceURL)
         try CLIWavWriter.writeWAV(samples: samples, to: wavURL)
-        context = CLIContext(
+        context = configuredTestCLIContext(
             dbPath: directory.appendingPathComponent("muesli.db").path,
             supportDir: directory.path
         )

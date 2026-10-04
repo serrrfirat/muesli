@@ -65,9 +65,15 @@ actor ParakeetUnifiedTranscriber {
 
     /// Transcribe a WAV file URL (16 kHz mono).
     func transcribe(wavURL: URL) async throws -> (text: String, processingTime: Double) {
-        guard let asrManager else { throw TranscriberError.notLoaded }
+        guard asrManager != nil else { throw TranscriberError.notLoaded }
         let converter = AudioConverter()
         let samples = try converter.resampleAudioFile(wavURL)
+        return try await transcribe(samples: samples)
+    }
+
+    /// Transcribe 16 kHz mono samples without writing audio to disk.
+    func transcribe(samples: [Float]) async throws -> (text: String, processingTime: Double) {
+        guard let asrManager else { throw TranscriberError.notLoaded }
         let start = CFAbsoluteTimeGetCurrent()
         let text = try await asrManager.transcribe(samples)
         let processingTime = CFAbsoluteTimeGetCurrent() - start

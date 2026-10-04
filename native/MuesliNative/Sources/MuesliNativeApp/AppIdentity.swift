@@ -2,7 +2,7 @@ import Foundation
 import MuesliCore
 
 public enum AppIdentity {
-    private static let defaultName = "Muesli"
+    private static let defaultName = "Hush"
 
     static var bundleName: String {
         stringValue(for: "CFBundleName") ?? defaultName
@@ -17,15 +17,16 @@ public enum AppIdentity {
     }
 
     static var supportDirectoryName: String {
-        stringValue(for: "MuesliSupportDirectoryName") ?? displayName
+        stringValue(for: "MuesliSupportDirectoryName") ?? "PrivateGranola"
     }
 
-    /// Public so App Intents (a separate module from the rest of the app)
-    /// can resolve the *running* app identity's data directory — e.g.
-    /// MuesliDev vs Muesli — instead of hardcoding the production default.
-    public static var supportDirectoryURL: URL {
-        MuesliPaths.defaultSupportDirectoryURL(appName: supportDirectoryName)
-    }
+    /// One immutable launch root preserves vault/Keychain identities and keeps
+    /// explicit verification and mock runs out of the user's production data.
+    public static let supportDirectoryURL: URL = {
+        let options = LaunchOptions()
+        return (options.root ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(options.mock ? "PrivateGranola-Mock" : "PrivateGranola", isDirectory: true)).standardizedFileURL
+    }()
 
     private static func stringValue(for key: String) -> String? {
         guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String else {

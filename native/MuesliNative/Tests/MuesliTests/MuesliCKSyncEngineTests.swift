@@ -74,7 +74,7 @@ struct MuesliCKSyncEngineTests {
     private func makeStore() throws -> DictationStore {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("muesli-cksyncengine-test-\(UUID().uuidString).db")
-        let store = DictationStore(databaseURL: url)
+        let store = configuredTestStore(databaseURL: url)
         try store.migrateIfNeeded()
         return store
     }

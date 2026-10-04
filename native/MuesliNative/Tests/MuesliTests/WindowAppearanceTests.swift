@@ -176,7 +176,7 @@ struct WindowAppearanceTests {
     func expandedSidebarScrollsLongFolderTree() {
         let supportDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("muesli-sidebar-test-\(UUID().uuidString)", isDirectory: true)
-        let store = DictationStore(databaseURL: supportDirectory.appendingPathComponent("muesli.db"))
+        let store = configuredTestStore(databaseURL: supportDirectory.appendingPathComponent("muesli.db"))
         try? store.migrateIfNeeded()
         let controller = MuesliController(
             runtime: RuntimePaths(
@@ -209,7 +209,7 @@ struct WindowAppearanceTests {
         let supportDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("muesli-window-test-\(UUID().uuidString)", isDirectory: true)
         let databaseURL = supportDirectory.appendingPathComponent("muesli.db")
-        let store = DictationStore(databaseURL: databaseURL)
+        let store = configuredTestStore(databaseURL: databaseURL)
         try? store.migrateIfNeeded()
         let controller = MuesliController(
             runtime: RuntimePaths(

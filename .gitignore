@@ -116,3 +116,7 @@ context.md
 *~
 .vercel
 docs/reports/meeting-transcription-pipeline.svg
+
+# Isolated encrypted Hush-port E2E evidence and SwiftPM cache
+.e2e/
+.build/

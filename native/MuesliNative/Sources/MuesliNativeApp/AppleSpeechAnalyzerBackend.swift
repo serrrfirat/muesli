@@ -222,6 +222,7 @@ enum AppleSpeechAnalyzerError: LocalizedError, Sendable {
     case assetUnavailable(String)
     case reservationUnavailable(Int)
     case emptyTranscript
+    case invalidAudioBuffer
 
     var errorDescription: String? {
         switch self {
@@ -235,6 +236,8 @@ enum AppleSpeechAnalyzerError: LocalizedError, Sendable {
             return "Apple Speech cannot reserve another language on this Mac (limit: \(maximum))."
         case .emptyTranscript:
             return "Apple Speech completed without producing a transcript."
+        case .invalidAudioBuffer:
+            return "Apple Speech could not create an in-memory audio buffer."
         }
     }
 }
@@ -436,6 +439,39 @@ actor AppleSpeechAnalyzerTranscriber {
     }
 
     func transcribe(wavURL: URL, requestedLocale: Locale = .current) async throws -> SpeechTranscriptionResult {
+        let audioFile = try AVAudioFile(forReading: wavURL)
+        return try await transcribe(requestedLocale: requestedLocale) { analyzer in
+            try await analyzer.analyzeSequence(from: audioFile)
+        }
+    }
+
+    func transcribe(samples: [Float], requestedLocale: Locale = .current) async throws -> SpeechTranscriptionResult {
+        guard !samples.isEmpty else { throw AppleSpeechAnalyzerError.emptyTranscript }
+        guard samples.count <= Int(UInt32.max),
+              let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                  sampleRate: 16_000, channels: 1, interleaved: false),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
+              let channel = buffer.floatChannelData?[0] else {
+            throw AppleSpeechAnalyzerError.invalidAudioBuffer
+        }
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { source in
+            channel.update(from: source.baseAddress!, count: source.count)
+        }
+        let input = AsyncStream<AnalyzerInput> { continuation in
+            continuation.yield(AnalyzerInput(buffer: buffer))
+            continuation.finish()
+        }
+        return try await transcribe(requestedLocale: requestedLocale) { analyzer in
+            try await analyzer.prepareToAnalyze(in: format)
+            return try await analyzer.analyzeSequence(input)
+        }
+    }
+
+    private func transcribe(
+        requestedLocale: Locale,
+        analyze: (SpeechAnalyzer) async throws -> CMTime?
+    ) async throws -> SpeechTranscriptionResult {
         let startedAt = CFAbsoluteTimeGetCurrent()
         let use = try await prepareAndRetain(requestedLocale: requestedLocale)
         defer { releaseUse(use.id) }
@@ -445,13 +481,17 @@ actor AppleSpeechAnalyzerTranscriber {
             modules: [transcriber],
             options: SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .lingering)
         )
-        let audioFile = try AVAudioFile(forReading: wavURL)
 
         async let collected = collectResults(from: transcriber)
-        if let lastSample = try await analyzer.analyzeSequence(from: audioFile) {
-            try await analyzer.finalizeAndFinish(through: lastSample)
-        } else {
+        do {
+            if let lastSample = try await analyze(analyzer) {
+                try await analyzer.finalizeAndFinish(through: lastSample)
+            } else {
+                await analyzer.cancelAndFinishNow()
+            }
+        } catch {
             await analyzer.cancelAndFinishNow()
+            throw error
         }
 
         let result = try await collected

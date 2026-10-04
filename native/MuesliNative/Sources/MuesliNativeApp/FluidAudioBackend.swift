@@ -67,6 +67,14 @@ actor FluidAudioTranscriber {
         return try await asrManager.transcribe(wavURL, decoderState: &decoderState, language: languageHint)
     }
 
+    /// Transcribe 16 kHz mono samples with the same language filter as the file path.
+    func transcribe(samples: [Float], language: String? = nil) async throws -> ASRResult {
+        guard let asrManager else { throw TranscriberError.notLoaded }
+        let languageHint = language.flatMap(Language.init(rawValue:))
+        var decoderState = TdtDecoderState.make(decoderLayers: await asrManager.decoderLayerCount)
+        return try await asrManager.transcribe(samples, decoderState: &decoderState, language: languageHint)
+    }
+
     func shutdown() {
         asrManager = nil
         loadedVersion = nil

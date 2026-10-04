@@ -2,8 +2,33 @@ import Testing
 import CloudKit
 import Foundation
 import MuesliCore
-import SQLite3
+import CSQLCipher
 @testable import MuesliNativeApp
+
+private let testDatabaseEncryptionKey = Data(repeating: 0xA5, count: 32)
+private let testDatabaseRawKey = Data(("x'" + String(repeating: "a5", count: 32) + "'").utf8)
+
+/// Test-only keys never reach the user's Keychain, including legacy-schema fixtures.
+func configuredTestStore(databaseURL: URL) -> DictationStore {
+    try! DictationStore.configureEncryption(key: testDatabaseEncryptionKey, databaseURL: databaseURL)
+    return DictationStore(databaseURL: databaseURL)
+}
+
+func openEncryptedTestDatabase(_ path: String, _ database: inout OpaquePointer?) -> Int32 {
+    do {
+        try DictationStore.configureEncryption(
+            key: testDatabaseEncryptionKey,
+            databaseURL: URL(fileURLWithPath: path)
+        )
+    } catch {
+        return SQLITE_ERROR
+    }
+    let result = sqlite3_open(path, &database)
+    guard result == SQLITE_OK else { return result }
+    return testDatabaseRawKey.withUnsafeBytes {
+        sqlite3_key(database, $0.baseAddress, Int32(testDatabaseRawKey.count))
+    }
+}
 
 @Suite("DictationStore", .serialized)
 struct DictationStoreTests {
@@ -13,7 +38,7 @@ struct DictationStoreTests {
     private func makeStore() throws -> DictationStore {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("muesli-test-\(UUID().uuidString).db")
-        let store = DictationStore(databaseURL: url)
+        let store = configuredTestStore(databaseURL: url)
         try store.migrateIfNeeded()
         return store
     }
@@ -44,7 +69,7 @@ struct DictationStoreTests {
         let id = try store.insertDictation(text: "test", durationSeconds: 1, source: "cua", startedAt: Date(), endedAt: Date())
         try store.insertComputerUseTrace(dictationID: id, finalStatus: "interrupted", finalMessage: "Stopped", events: [])
         var db: OpaquePointer?
-        #expect(sqlite3_open(store.databasePath().path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(store.databasePath().path, &db) == SQLITE_OK)
         defer { sqlite3_close(db) }
         #expect(sqlite3_exec(db, "UPDATE computer_use_traces SET trace_json = 'invalid json'", nil, nil, nil) == SQLITE_OK)
         let trace = try #require(store.dictation(id: id)?.computerUseTrace)
@@ -56,7 +81,7 @@ struct DictationStoreTests {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("muesli-legacy-test-\(UUID().uuidString).db")
         var db: OpaquePointer?
-        #expect(sqlite3_open(url.path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(url.path, &db) == SQLITE_OK)
         defer { sqlite3_close(db) }
         let sql = """
         CREATE TABLE meetings (
@@ -76,7 +101,7 @@ struct DictationStoreTests {
         );
         """
         #expect(sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK)
-        return DictationStore(databaseURL: url)
+        return configuredTestStore(databaseURL: url)
     }
 
     private func sqliteTestError(_ message: String) -> NSError {
@@ -85,7 +110,7 @@ struct DictationStoreTests {
 
     private func setFolderParentRaw(folderID: Int64, parentID: Int64, store: DictationStore) throws {
         var db: OpaquePointer?
-        guard sqlite3_open(store.databasePath().path, &db) == SQLITE_OK else {
+        guard openEncryptedTestDatabase(store.databasePath().path, &db) == SQLITE_OK else {
             throw sqliteTestError("failed to open test database")
         }
         defer { sqlite3_close(db) }
@@ -110,7 +135,7 @@ struct DictationStoreTests {
         store: DictationStore
     ) throws {
         var db: OpaquePointer?
-        guard sqlite3_open(store.databasePath().path, &db) == SQLITE_OK else {
+        guard openEncryptedTestDatabase(store.databasePath().path, &db) == SQLITE_OK else {
             throw sqliteTestError("failed to open test database")
         }
         defer { sqlite3_close(db) }
@@ -141,7 +166,7 @@ struct DictationStoreTests {
         store: DictationStore
     ) throws {
         var db: OpaquePointer?
-        guard sqlite3_open(store.databasePath().path, &db) == SQLITE_OK else {
+        guard openEncryptedTestDatabase(store.databasePath().path, &db) == SQLITE_OK else {
             throw sqliteTestError("failed to open test database")
         }
         defer { sqlite3_close(db) }
@@ -351,7 +376,7 @@ struct DictationStoreTests {
     func migrationReplacesCalendarEventUniqueness() throws {
         let store = try makeLegacyStore()
         var db: OpaquePointer?
-        #expect(sqlite3_open(store.databasePath().path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(store.databasePath().path, &db) == SQLITE_OK)
         #expect(sqlite3_exec(
             db,
             "CREATE UNIQUE INDEX idx_meetings_calendar_event_id ON meetings(calendar_event_id) WHERE calendar_event_id IS NOT NULL",
@@ -1083,7 +1108,7 @@ struct DictationStoreTests {
     func migrationRepairsMacOriginMeetingSource() throws {
         let store = try makeStore()
         var db: OpaquePointer?
-        #expect(sqlite3_open(store.databasePath().path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(store.databasePath().path, &db) == SQLITE_OK)
         defer { sqlite3_close(db) }
 
         let updatedAt = Date(timeIntervalSince1970: 1_770_000_000).timeIntervalSince1970
@@ -1746,7 +1771,7 @@ struct DictationStoreTests {
     func unknownMeetingSourceFallsBackToMeeting() throws {
         let store = try makeStore()
         var db: OpaquePointer?
-        #expect(sqlite3_open(store.databasePath().path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(store.databasePath().path, &db) == SQLITE_OK)
         defer { sqlite3_close(db) }
 
         let sql = """
@@ -2590,7 +2615,7 @@ struct DictationStoreTests {
     /// (which exclude soft-deleted meetings entirely).
     private func rawMeetingVisualContext(id: Int64, store: DictationStore) throws -> String? {
         var db: OpaquePointer?
-        guard sqlite3_open(store.databasePath().path, &db) == SQLITE_OK else {
+        guard openEncryptedTestDatabase(store.databasePath().path, &db) == SQLITE_OK else {
             throw sqliteTestError("failed to open test database")
         }
         defer { sqlite3_close(db) }
@@ -3526,7 +3551,7 @@ struct DictationStoreTests {
         )
 
         var db: OpaquePointer?
-        #expect(sqlite3_open(store.databasePath().path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(store.databasePath().path, &db) == SQLITE_OK)
         #expect(sqlite3_exec(db, "UPDATE dictations SET word_count = 99 WHERE id = \(dictationID)", nil, nil, nil) == SQLITE_OK)
         #expect(sqlite3_exec(db, "DELETE FROM local_migrations WHERE identifier = 'quill_statistics_spoken_instruction_v1'", nil, nil, nil) == SQLITE_OK)
         sqlite3_close(db)
@@ -3553,7 +3578,7 @@ struct DictationStoreTests {
         )
 
         var db: OpaquePointer?
-        #expect(sqlite3_open(store.databasePath().path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(store.databasePath().path, &db) == SQLITE_OK)
         #expect(sqlite3_exec(
             db,
             "UPDATE dictations SET word_count = 3, cloud_record_name = 'quill-sync-test', sync_dirty = 0 WHERE id = \(dictationID)",
@@ -3801,7 +3826,7 @@ struct DictationStoreTests {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("muesli-target-app-legacy-\(UUID().uuidString).db")
         var db: OpaquePointer?
-        #expect(sqlite3_open(url.path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(url.path, &db) == SQLITE_OK)
         let legacySQL = """
         CREATE TABLE dictations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3827,10 +3852,10 @@ struct DictationStoreTests {
         #expect(sqlite3_exec(db, legacySQL, nil, nil, nil) == SQLITE_OK)
         sqlite3_close(db)
 
-        let store = DictationStore(databaseURL: url)
+        let store = configuredTestStore(databaseURL: url)
         try store.migrateIfNeeded()
 
-        #expect(sqlite3_open(url.path, &db) == SQLITE_OK)
+        #expect(openEncryptedTestDatabase(url.path, &db) == SQLITE_OK)
         #expect(sqlite3_exec(
             db,
             """

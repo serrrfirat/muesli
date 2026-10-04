@@ -218,6 +218,7 @@ struct SettingsView: View {
 
     private var meetingBackendOptions: [BackendOption] {
         downloadedBackendOptions.filter(\.supportsMeetingTranscription)
+            + (controller.hushModel == nil ? [] : [.nearAI])
     }
 
     private var selectedMeetingLiveCaptionLabel: String {
@@ -972,6 +973,9 @@ struct SettingsView: View {
             }
             .id(FeatureTourTarget.dictationProviderSetting.rawValue)
             .featureTourTarget(.dictationProviderSetting)
+            if controller.hushModel != nil {
+                settingsDescription("Hush dictation stays on device. Meetings can also use verified NEAR AI; unverified hosted transcription is disabled.")
+            }
             Divider().background(MuesliTheme.surfaceBorder)
             if appState.dictationProvider == .openAI {
                 openAIDictationSettingsRows
@@ -1364,18 +1368,33 @@ struct SettingsView: View {
                     onChange: { value in controller.updateConfig { $0.lmStudioURL = value } }
                 ).frame(height: 22)
             }
+        } else if backend == .hosted(.nearAI) {
+            nearAISettingsRows
         } else if backend == .hosted(.customLLM) {
             customLLMSettingsRows(model: appState.config.quilModel) { value in
                 controller.updateConfig { $0.quilModel = value }
             }
         }
-        if backend != .hosted(.customLLM) {
+        if backend != .hosted(.customLLM) && backend != .hosted(.nearAI) {
             Divider().background(MuesliTheme.surfaceBorder)
             settingsRow("Quill model", controlWidth: meetingControlWidth) {
                 settingsModelTextField(
                     currentModel: appState.config.quilModel,
                     placeholder: TranscriptCleanupClient.defaultModel(for: backend)
                 ) { value in controller.updateConfig { $0.quilModel = value } }
+            }
+        }
+    }
+
+    private var nearAISettingsRows: some View {
+        VStack(alignment: .leading, spacing: MuesliTheme.spacing12) {
+            settingsRow("NEAR AI model", controlWidth: meetingControlWidth) {
+                Text(controller.hushModel?.settings.model ?? "Vault locked")
+                    .font(MuesliTheme.caption())
+            }
+            settingsRow("Trust and credentials", controlWidth: meetingControlWidth) {
+                Button("Privacy and NEAR AI settings") { controller.openSettingsTab() }
+                    .buttonStyle(.link)
             }
         }
     }
@@ -1533,6 +1552,8 @@ struct SettingsView: View {
             customLLMSettingsRows(model: appState.config.postProcessorCustomLLMModel) {
                 controller.updatePostProcessorModel($0, for: backend)
             }
+        case .some(.nearAI):
+            nearAISettingsRows
         default:
             EmptyView()
         }
@@ -1742,6 +1763,8 @@ struct SettingsView: View {
                 customLLMSettingsRows(model: appState.config.customLLMModel) {
                     val in controller.updateConfig { $0.customLLMModel = val }
                 }
+            } else if appState.selectedMeetingSummaryBackend == .nearAI {
+                nearAISettingsRows
             } else {
                 settingsRow("Account", controlWidth: meetingControlWidth) {
                     openRouterAccountControl()

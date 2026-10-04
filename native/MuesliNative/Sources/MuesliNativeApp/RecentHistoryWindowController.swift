@@ -141,6 +141,10 @@ final class RecentHistoryWindowController: NSObject, NSWindowDelegate {
     /// `syncAppState()`, so reading it here would apply the previous theme whenever the appearance
     /// is refreshed before that assignment.
     private func applyAppearance(to window: NSWindow) {
+        if controller.hushModel != nil {
+            window.appearance = controller.appState.hushAppearance.appKit
+            return
+        }
         let name = Self.appearanceName(for: controller.config.darkMode)
         if window.appearance?.name != name {
             window.appearance = NSAppearance(named: name)
@@ -170,7 +174,7 @@ final class RecentHistoryWindowController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = AppIdentity.displayName
+        window.title = controller.hushModel == nil ? AppIdentity.displayName : "Hush"
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.contentMinSize = NSSize(
@@ -196,11 +200,13 @@ final class RecentHistoryWindowController: NSObject, NSWindowDelegate {
         self.window = window
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self,
-                  event.modifierFlags.contains(.command),
-                  event.charactersIgnoringModifiers == "f" else {
-                return event
+            guard let self, event.modifierFlags.contains(.command) else { return event }
+            if event.charactersIgnoringModifiers == "\\" {
+                self.controller.appState.hushSidebarCollapsed.toggle()
+                return nil
             }
+            guard ["f", "k"].contains(event.charactersIgnoringModifiers ?? "") else { return event }
+            self.controller.appState.hushSidebarCollapsed = false
             self.controller.appState.focusSearchField = true
             return nil
         }

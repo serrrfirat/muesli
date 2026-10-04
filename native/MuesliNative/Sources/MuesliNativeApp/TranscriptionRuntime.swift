@@ -580,6 +580,10 @@ actor TranscriptionCoordinator {
         progress: ((Double, String?) -> Void)? = nil,
         progressSnapshot: ModelDownloadProgressHandler? = nil
     ) async throws {
+        if backend == .nearAI {
+            try await HushNearAIProvider.prepareTranscription()
+            return
+        }
         activeBackend = backend.backend
 
         if includeMeetingHelpers {
@@ -977,7 +981,7 @@ actor TranscriptionCoordinator {
         )
         result = removeArtifacts(result)
         if !result.text.isEmpty {
-            Qwen3PostProcessorLogging.logVerbose("Dictation raw transcript after artifact cleanup: \(result.text)")
+            Qwen3PostProcessorLogging.logVerbose("Dictation raw transcript after artifact cleanup: \(result.text.count) characters")
         }
         // Capture this after ASR awaits. The snapshot is then passed through the
         // complete cleanup path, so a model switch cannot change the model or
@@ -992,7 +996,7 @@ actor TranscriptionCoordinator {
         ) ?? removeFillersWithLogging(result)
         let final = applyCustomWords(result, customWords: customWords)
         if !final.text.isEmpty {
-            Qwen3PostProcessorLogging.logVerbose("Dictation final transcript: \(final.text)")
+            Qwen3PostProcessorLogging.logVerbose("Dictation final transcript: \(final.text.count) characters")
         }
         return final
     }
@@ -1089,6 +1093,84 @@ actor TranscriptionCoordinator {
         ))
     }
 
+    /// Secure capture supplies 16 kHz mono PCM directly; no decrypted WAV is materialized on disk.
+    func transcribeMeetingChunk(
+        samples: [Float],
+        backend: BackendOption,
+        cohereLanguage: CohereTranscribeLanguage = .defaultLanguage,
+        bodhanLanguage: BodhanLanguage = .defaultLanguage,
+        bodhanOutputMode: BodhanOutputMode = .mixed,
+        whisperLanguage: WhisperKitLanguage = .defaultLanguage,
+        qwen3AsrLanguage: Qwen3AsrLanguage = .defaultLanguage,
+        parakeetLanguage: ParakeetLanguage = .defaultLanguage,
+        appleSpeechLanguage: String = AppleSpeechLanguageOption.systemIdentifier
+    ) async throws -> SpeechTranscriptionResult {
+        try Task.checkCancellation()
+        if let vadManager {
+            let decisions = try await vadManager.process(samples)
+            if !decisions.contains(where: { $0.probability > 0.5 }) {
+                return SpeechTranscriptionResult(text: "", segments: [])
+            }
+        }
+        let result: (text: String, processingTime: Double)
+        switch backend.backend {
+        case "fluidaudio":
+            let transcription = try await fluidTranscriber.transcribe(samples: samples, language: parakeetLanguage.isoCode)
+            let text = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let segments = (transcription.tokenTimings ?? []).map {
+                SpeechSegment(start: $0.startTime, end: $0.endTime, text: $0.token)
+            }
+            return cleanMeetingTranscript(SpeechTranscriptionResult(
+                text: text,
+                segments: segments.isEmpty && !text.isEmpty
+                    ? [SpeechSegment(start: 0, end: transcription.duration, text: text)] : segments
+            ))
+        case "whisper":
+            result = try await whisperTranscriber.transcribe(samples: samples, language: whisperLanguage)
+        case "parakeet-unified":
+            result = try await parakeetUnifiedTranscriber.transcribe(samples: samples)
+        case "sensevoice":
+            result = try await senseVoiceTranscriber.transcribe(samples: samples)
+        case "qwen":
+            guard #available(macOS 15, *) else { throw AppError("Qwen3 ASR requires macOS 15 or later") }
+            result = try await qwen3Transcriber.transcribe(samples: samples, language: qwen3AsrLanguage.pinnedCode)
+        case "cohere":
+            guard #available(macOS 15, *) else { throw AppError("Cohere Transcribe requires macOS 15 or later") }
+            let transcription = try await cohereTranscriber.transcribe(samples: samples, language: cohereLanguage)
+            result = (transcription.text, transcription.processingTime)
+        case "bodhan":
+            guard #available(macOS 15, *) else { throw AppError("Bodhan requires macOS 15 or later") }
+            result = try await bodhanTranscriber.transcribe(samples: samples, modelID: backend.model,
+                language: bodhanLanguage, outputMode: bodhanOutputMode)
+        case "gemma4-litert":
+            guard #available(macOS 15, *) else { throw AppError("Gemma 4 requires macOS 15 or later") }
+            result = try await gemma4LiteRTTranscriber.transcribe(samples: samples,
+                model: Gemma4LiteRTModel.resolved(backend.model))
+        case "nemotron35":
+            guard #available(macOS 15, *) else { throw AppError("Nemotron 3.5 requires macOS 15 or later") }
+            let transcriber = try await getLoadedNemotron35Transcriber()
+            result = try await transcriber.transcribe(samples: samples)
+        case "apple-speech":
+            guard #available(macOS 26, *) else { throw AppError("Apple Speech requires macOS 26 or later") }
+            await appleSpeechLifecycle.beginUse()
+            do {
+                let transcription = try await appleSpeechTranscriber.transcribe(samples: samples,
+                    requestedLocale: AppleSpeechLanguageOption.requestedLocale(for: appleSpeechLanguage))
+                await appleSpeechLifecycle.endUse()
+                return cleanMeetingTranscript(transcription)
+            } catch {
+                await appleSpeechLifecycle.endUse()
+                throw error
+            }
+        default:
+            throw AppError("The selected backend is not a local transcription model")
+        }
+        try Task.checkCancellation()
+        let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleanMeetingTranscript(SpeechTranscriptionResult(text: text,
+            segments: text.isEmpty ? [] : [SpeechSegment(start: 0, end: Double(samples.count) / 16_000, text: text)]))
+    }
+
     /// Recorded-file replay only. Live meeting finalization remains unchanged.
     func diarizeRecordedAudio(
         at url: URL,
@@ -1163,7 +1245,7 @@ actor TranscriptionCoordinator {
         let filtered = removeFillers(result)
         let elapsedMs = (CFAbsoluteTimeGetCurrent() - start) * 1000
         if filtered.text != result.text {
-            Qwen3PostProcessorLogging.logVerbose("FillerWordFilter applied in \(String(format: "%.1f", elapsedMs))ms -> \(filtered.text)")
+            Qwen3PostProcessorLogging.logVerbose("FillerWordFilter changed output in \(String(format: "%.1f", elapsedMs))ms")
         } else {
             Qwen3PostProcessorLogging.logVerbose("FillerWordFilter skipped effective changes (\(String(format: "%.1f", elapsedMs))ms)")
         }
@@ -1445,6 +1527,8 @@ actor TranscriptionCoordinator {
         appleSpeechLanguage: String
     ) async throws -> SpeechTranscriptionResult {
         switch backend.backend {
+        case "near_ai":
+            return try await HushNearAIProvider.transcribe(at: url)
         case "whisper":
             let language = backend.supportsWhisperLanguageSelection
                 ? whisperLanguage
@@ -1482,7 +1566,7 @@ actor TranscriptionCoordinator {
     private func transcribeWithFluidAudio(url: URL, language: ParakeetLanguage) async throws -> SpeechTranscriptionResult {
         fputs("[muesli-native] transcribing with FluidAudio: \(url.lastPathComponent)\n", stderr)
         let result = try await fluidTranscriber.transcribe(wavURL: url, language: language.isoCode)
-        fputs("[muesli-native] FluidAudio result: \(result.text.prefix(80)) (took \(String(format: "%.3f", result.processingTime))s)\n", stderr)
+        fputs("[muesli-native] FluidAudio completed in \(String(format: "%.3f", result.processingTime))s\n", stderr)
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let segments = (result.tokenTimings ?? []).map { timing in
             SpeechSegment(start: timing.startTime, end: timing.endTime, text: timing.token)
@@ -1498,7 +1582,7 @@ actor TranscriptionCoordinator {
     private func transcribeWithParakeetUnified(url: URL) async throws -> SpeechTranscriptionResult {
         fputs("[muesli-native] transcribing with Parakeet Unified: \(url.lastPathComponent)\n", stderr)
         let result = try await parakeetUnifiedTranscriber.transcribe(wavURL: url)
-        fputs("[muesli-native] Parakeet Unified result: \(result.text.prefix(80)) (took \(String(format: "%.3f", result.processingTime))s)\n", stderr)
+        fputs("[muesli-native] Parakeet Unified completed in \(String(format: "%.3f", result.processingTime))s\n", stderr)
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         return SpeechTranscriptionResult(
             text: text,
@@ -1514,7 +1598,7 @@ actor TranscriptionCoordinator {
     ) async throws -> SpeechTranscriptionResult {
         fputs("[muesli-native] transcribing with WhisperKit: \(url.lastPathComponent)\n", stderr)
         let result = try await whisperTranscriber.transcribe(wavURL: url, language: language)
-        fputs("[muesli-native] WhisperKit result: \(result.text.prefix(80)) (took \(String(format: "%.3f", result.processingTime))s)\n", stderr)
+        fputs("[muesli-native] WhisperKit completed in \(String(format: "%.3f", result.processingTime))s\n", stderr)
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         return SpeechTranscriptionResult(
             text: text,
@@ -1528,7 +1612,7 @@ actor TranscriptionCoordinator {
         if #available(macOS 15, *) {
             fputs("[muesli-native] transcribing with Qwen3 ASR: \(url.lastPathComponent)\n", stderr)
             let result = try await qwen3Transcriber.transcribe(wavURL: url, language: language.pinnedCode)
-            fputs("[muesli-native] Qwen3 ASR result: \(result.text.prefix(80)) (took \(String(format: "%.3f", result.processingTime))s)\n", stderr)
+            fputs("[muesli-native] Qwen3 ASR completed in \(String(format: "%.3f", result.processingTime))s\n", stderr)
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             return SpeechTranscriptionResult(
                 text: text,
@@ -1546,7 +1630,7 @@ actor TranscriptionCoordinator {
     private func transcribeWithSenseVoice(url: URL) async throws -> SpeechTranscriptionResult {
         fputs("[muesli-native] transcribing with SenseVoice: \(url.lastPathComponent)\n", stderr)
         let result = try await senseVoiceTranscriber.transcribe(wavURL: url)
-        fputs("[muesli-native] SenseVoice result: \(result.text.prefix(80)) (took \(String(format: "%.3f", result.processingTime))s)\n", stderr)
+        fputs("[muesli-native] SenseVoice completed in \(String(format: "%.3f", result.processingTime))s\n", stderr)
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         return SpeechTranscriptionResult(
             text: text,
@@ -1586,7 +1670,7 @@ actor TranscriptionCoordinator {
         if #available(macOS 15, *) {
             fputs("[muesli-native] transcribing with Cohere Transcribe: \(url.lastPathComponent)\n", stderr)
             let result = try await cohereTranscriber.transcribe(wavURL: url, language: language)
-            fputs("[muesli-native] Cohere Transcribe result: \(result.text.prefix(80)) (took \(String(format: "%.3f", result.processingTime))s)\n", stderr)
+            fputs("[muesli-native] Cohere Transcribe completed in \(String(format: "%.3f", result.processingTime))s\n", stderr)
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             return SpeechTranscriptionResult(
                 text: text,
@@ -1630,7 +1714,7 @@ actor TranscriptionCoordinator {
             fputs("[muesli-native] transcribing with Nemotron 3.5: \(url.lastPathComponent)\n", stderr)
             let transcriber = try await getLoadedNemotron35Transcriber()
             let result = try await transcriber.transcribe(wavURL: url)
-            fputs("[muesli-native] Nemotron 3.5 result: \(result.text.prefix(80)) (took \(String(format: "%.3f", result.processingTime))s)\n", stderr)
+            fputs("[muesli-native] Nemotron 3.5 completed in \(String(format: "%.3f", result.processingTime))s\n", stderr)
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             return SpeechTranscriptionResult(
                 text: text,

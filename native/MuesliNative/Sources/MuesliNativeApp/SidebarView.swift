@@ -146,6 +146,7 @@ struct SidebarView: View {
                 .padding(.bottom, MuesliTheme.spacing12)
 
             collapsedItem(tab: .timeline, icon: "clock", label: "Timeline")
+            if controller.hushModel != nil { collapsedItem(tab: .chat, icon: "bubble.left.and.bubble.right", label: "Chat") }
             collapsedItem(tab: .dictations, icon: "waveform", label: "Dictations")
             collapsedItem(tab: .meetings, icon: "person.2", label: "Meetings")
             collapsedItem(tab: .insights, icon: "chart.bar.xaxis", label: "Insights")
@@ -177,6 +178,8 @@ struct SidebarView: View {
                     // rail must restore the browser, not leave a document open.
                     meetingsExpanded = true
                     controller.showMeetingsHome()
+                } else if tab == .chat {
+                    controller.showHushChat()
                 } else {
                     appState.selectedTab = tab
                 }
@@ -214,6 +217,7 @@ struct SidebarView: View {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: MuesliTheme.spacing4) {
                         sidebarItem(tab: .timeline, icon: "clock", label: "Timeline")
+                        if controller.hushModel != nil { sidebarItem(tab: .chat, icon: "bubble.left.and.bubble.right", label: "Chat") }
                         sidebarItem(tab: .dictations, icon: "waveform", label: "Dictations")
                         meetingsSection
                         sidebarItem(tab: .insights, icon: "chart.bar.xaxis", label: "Insights")
@@ -334,6 +338,10 @@ struct SidebarView: View {
                 .font(MuesliTheme.callout())
                 .foregroundStyle(MuesliTheme.textPrimary)
                 .focused($isSearchFieldFocused)
+                .accessibilityIdentifier("hush.sidebar.search")
+                .onChange(of: isSearchFieldFocused) { _, focused in
+                    appState.hushSearchFocused = focused
+                }
             if !appState.searchQuery.isEmpty {
                 Button {
                     controller.clearSearch()
@@ -356,6 +364,12 @@ struct SidebarView: View {
         )
         .padding(.horizontal, sidebarRowOuterPadding)
         .padding(.bottom, MuesliTheme.spacing8)
+        .onAppear {
+            if appState.focusSearchField {
+                isSearchFieldFocused = true
+                appState.focusSearchField = false
+            }
+        }
         .onChange(of: appState.focusSearchField) { _, shouldFocus in
             if shouldFocus {
                 isSearchFieldFocused = true
@@ -629,6 +643,8 @@ struct SidebarView: View {
             withAnimation(.easeInOut(duration: 0.15)) {
                 if tab == .timeline {
                     controller.showTimelineHome()
+                } else if tab == .chat {
+                    controller.showHushChat()
                 } else {
                     appState.selectedTab = tab
                 }
@@ -678,11 +694,12 @@ struct SidebarView: View {
 
     @ViewBuilder
     private var darkModeToggle: some View {
-        let isDark = appState.config.darkMode
+        let isDark = controller.hushModel == nil ? appState.config.darkMode : colorScheme == .dark
         HStack(spacing: 2) {
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    controller.updateConfig { $0.darkMode = false }
+                    if controller.hushModel == nil { controller.updateConfig { $0.darkMode = false } }
+                    else { controller.setHushAppearance(.light) }
                 }
             } label: {
                 Image(systemName: "sun.max.fill")
@@ -699,7 +716,8 @@ struct SidebarView: View {
 
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    controller.updateConfig { $0.darkMode = true }
+                    if controller.hushModel == nil { controller.updateConfig { $0.darkMode = true } }
+                    else { controller.setHushAppearance(.dark) }
                 }
             } label: {
                 Image(systemName: "moon.fill")

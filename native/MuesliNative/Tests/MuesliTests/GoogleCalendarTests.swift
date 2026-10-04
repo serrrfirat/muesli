@@ -486,7 +486,7 @@ struct GoogleCalendarTests {
     func calendarPlaceholderOccurrenceDeduplication() async throws {
         let databaseURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("muesli-calendar-occurrence-\(UUID().uuidString).db")
-        let store = DictationStore(databaseURL: databaseURL)
+        let store = configuredTestStore(databaseURL: databaseURL)
         try store.migrateIfNeeded()
         let controller = MuesliController(
             runtime: RuntimePaths(
